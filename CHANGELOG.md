@@ -13,6 +13,10 @@
 - Auto-clean empty local conversations (no assistant reply) on every sync run
 - Fix `sync_memory` crash when `list_drive_folders` returns string IDs
 - Add pytest smoke tests for all flag combinations (`tests/test_smoke.py`)
+- Skip gitignored dirs from sync, apply `--chat` filter in pull phase and skip memory
+- Fix zombie daemon processes by killing PID tree before starting new daemon
+- Auto-create Claude project dir instead of crashing when it doesn't exist
+- Make memory sync chat-specific on Drive using `originSessionId` frontmatter (Drive structure: `_memory/<chat_id>/*.md`), auto-migrate legacy flat memory files to largest chat
 
 ## v0.1.6
 

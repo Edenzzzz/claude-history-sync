@@ -1044,8 +1044,67 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
     return pushed, pulled, skipped
 
 
-def sync_memory(service, folder_id, local_dir: Path, args, indent="    "):
-    """Sync the memory/ subfolder between local_dir and a _memory Drive folder."""
+def _get_memory_origin_session(md_path: Path) -> str | None:
+    """Extract originSessionId from a memory file's YAML frontmatter."""
+    try:
+        with open(md_path, "r") as f:
+            first_line = f.readline().strip()
+            if first_line != "---":
+                return None
+            for line in f:
+                line = line.strip()
+                if line == "---":
+                    break
+                if line.startswith("originSessionId:"):
+                    return line.split(":", 1)[1].strip()
+    except (OSError, UnicodeDecodeError):
+        pass
+    return None
+
+
+def _find_largest_chat(local_jsons: dict, remote_files: dict) -> str | None:
+    """Find the largest chat ID from local and remote JSONL files."""
+    best_id, best_size = None, 0
+    for fname, path in local_jsons.items():
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > best_size:
+            best_size = size
+            best_id = fname.replace(".jsonl", "")
+    for fname, info in remote_files.items():
+        if not fname.endswith(".jsonl") or fname.startswith("_"):
+            continue
+        size = int(info.get("size", 0))
+        if size > best_size:
+            best_size = size
+            best_id = fname.replace(".jsonl", "")
+    return best_id
+
+
+def _migrate_flat_memory(service, memory_folder_id, target_chat_folder_id):
+    """Move flat memory files (legacy) into a chat-specific subfolder."""
+    flat_files = list_remote_files(service, memory_folder_id)
+    for fname, info in flat_files.items():
+        if not fname.endswith(".md"):
+            continue
+        service.files().update(
+            fileId=info["id"],
+            addParents=target_chat_folder_id,
+            removeParents=memory_folder_id,
+        ).execute()
+    return len(flat_files)
+
+
+def sync_memory(service, folder_id, local_dir: Path, args, indent="    ",
+                local_jsons=None, remote_files_map=None):
+    """Sync the memory/ subfolder between local_dir and a _memory Drive folder.
+
+    Memory files are organized per-chat on Drive: _memory/<chat_id>/*.md
+    Each memory file's originSessionId frontmatter determines which chat it belongs to.
+    Files without originSessionId are associated with the largest chat in the repo.
+    """
     memory_dir = local_dir / "memory"
     has_local = memory_dir.is_dir() and any(memory_dir.glob("*.md"))
 
@@ -1062,14 +1121,30 @@ def sync_memory(service, folder_id, local_dir: Path, args, indent="    "):
     if memory_folder_id is None and args.pull_only:
         return 0, 0
     if memory_folder_id is None and args.dry_run:
-        # Preview mode — count what would be pushed
         local_files = list(memory_dir.glob("*.md"))
         if local_files:
             print(f"{indent}[WOULD PUSH] memory/ ({len(local_files)} files)")
         return len(local_files), 0
 
-    # List remote memory files
-    remote_files = list_remote_files(service, memory_folder_id) if memory_folder_id else {}
+    # Determine fallback chat ID (largest chat) for files without originSessionId
+    fallback_chat_id = _find_largest_chat(
+        local_jsons or {}, remote_files_map or {},
+    )
+
+    # List chat subfolders inside _memory on Drive
+    chat_subfolders = list_drive_folders(service, memory_folder_id)
+
+    # Migrate legacy flat memory files into largest-chat subfolder
+    flat_files = list_remote_files(service, memory_folder_id)
+    flat_md_files = {k: v for k, v in flat_files.items() if k.endswith(".md")}
+    if flat_md_files and fallback_chat_id and not args.dry_run:
+        target_id = chat_subfolders.get(fallback_chat_id)
+        if not target_id:
+            target_id = get_or_create_folder(service, fallback_chat_id, memory_folder_id)
+            chat_subfolders[fallback_chat_id] = target_id
+        moved = _migrate_flat_memory(service, memory_folder_id, target_id)
+        if moved:
+            print(f"{indent}[memory] migrated {moved} file(s) to chat {fallback_chat_id[:8]}…")
 
     # Ensure local memory dir exists for pull
     if not memory_dir.exists() and not args.push_only:
@@ -1078,56 +1153,78 @@ def sync_memory(service, folder_id, local_dir: Path, args, indent="    "):
 
     pushed = pulled = 0
 
-    # Sync local -> remote
+    # --- Push: group local files by originSessionId, sync to per-chat subfolder ---
     if has_local and not args.pull_only:
+        # Group local memory files by chat ID
+        by_chat = {}  # chat_id -> [md_path, ...]
         for md_file in sorted(memory_dir.glob("*.md")):
-            fname = md_file.name
-            local_md5 = local_file_md5(md_file)
-            local_mtime = md_file.stat().st_mtime
+            origin = _get_memory_origin_session(md_file) or fallback_chat_id
+            if origin:
+                by_chat.setdefault(origin, []).append(md_file)
 
-            if fname in remote_files:
-                remote = remote_files[fname]
-                if local_md5 == remote.get("md5Checksum", ""):
-                    continue
-                remote_mtime = datetime.fromisoformat(
-                    remote["modifiedTime"].replace("Z", "+00:00")
-                ).timestamp()
-                if local_mtime > remote_mtime:
+        for chat_id, md_files in by_chat.items():
+            # Get or create chat subfolder in _memory
+            chat_folder_id = chat_subfolders.get(chat_id)
+            if not chat_folder_id and not args.dry_run:
+                chat_folder_id = get_or_create_folder(service, chat_id, memory_folder_id)
+                chat_subfolders[chat_id] = chat_folder_id
+
+            remote_chat_files = list_remote_files(service, chat_folder_id) if chat_folder_id else {}
+
+            for md_file in md_files:
+                fname = md_file.name
+                local_md5 = local_file_md5(md_file)
+                local_mtime = md_file.stat().st_mtime
+
+                if fname in remote_chat_files:
+                    remote = remote_chat_files[fname]
+                    if local_md5 == remote.get("md5Checksum", ""):
+                        continue
+                    remote_mtime = datetime.fromisoformat(
+                        remote["modifiedTime"].replace("Z", "+00:00")
+                    ).timestamp()
+                    if local_mtime > remote_mtime:
+                        if not args.dry_run:
+                            media = MediaFileUpload(str(md_file))
+                            service.files().update(fileId=remote["id"], media_body=media).execute()
+                        pushed += 1
+                else:
                     if not args.dry_run:
                         media = MediaFileUpload(str(md_file))
-                        service.files().update(fileId=remote["id"], media_body=media).execute()
+                        service.files().create(
+                            body={"name": fname, "parents": [chat_folder_id]},
+                            media_body=media,
+                        ).execute()
                     pushed += 1
-            else:
-                if not args.dry_run:
-                    media = MediaFileUpload(str(md_file))
-                    service.files().create(
-                        body={"name": fname, "parents": [memory_folder_id]},
-                        media_body=media,
-                    ).execute()
-                pushed += 1
 
-    # Pull remote -> local
+    # --- Pull: iterate chat subfolders, download memory files ---
     if not args.push_only:
+        # Refresh chat subfolders (may have been created during push)
+        if not chat_subfolders:
+            chat_subfolders = list_drive_folders(service, memory_folder_id)
         local_names = {p.name for p in memory_dir.glob("*.md")} if memory_dir.is_dir() else set()
-        for fname, remote in remote_files.items():
-            if not fname.endswith(".md"):
-                continue
-            local_path = memory_dir / fname
-            if fname in local_names:
-                local_md5 = local_file_md5(local_path)
-                if local_md5 == remote.get("md5Checksum", ""):
+
+        for chat_id, chat_folder_id in chat_subfolders.items():
+            remote_chat_files = list_remote_files(service, chat_folder_id)
+            for fname, remote in remote_chat_files.items():
+                if not fname.endswith(".md"):
                     continue
-                remote_mtime = datetime.fromisoformat(
-                    remote["modifiedTime"].replace("Z", "+00:00")
-                ).timestamp()
-                if remote_mtime > local_path.stat().st_mtime:
+                local_path = memory_dir / fname
+                if fname in local_names:
+                    local_md5 = local_file_md5(local_path)
+                    if local_md5 == remote.get("md5Checksum", ""):
+                        continue
+                    remote_mtime = datetime.fromisoformat(
+                        remote["modifiedTime"].replace("Z", "+00:00")
+                    ).timestamp()
+                    if remote_mtime > local_path.stat().st_mtime:
+                        if not args.dry_run:
+                            download_file(service, remote["id"], local_path)
+                        pulled += 1
+                else:
                     if not args.dry_run:
                         download_file(service, remote["id"], local_path)
                     pulled += 1
-            else:
-                if not args.dry_run:
-                    download_file(service, remote["id"], local_path)
-                pulled += 1
 
     if pushed or pulled:
         action_parts = []
@@ -1399,6 +1496,7 @@ def run_sync(args, service, root_folder_id):
                 if not getattr(args, "chat_id", None):
                     mem_pushed, mem_pulled = sync_memory(
                         service, subfolder_id, project_dir, args, indent="  ║   ",
+                        local_jsons=local_jsons, remote_files_map=remote_sub_files,
                     )
                 if pushed or pulled:
                     if args.dry_run:
@@ -1583,6 +1681,7 @@ def run_sync(args, service, root_folder_id):
                     if not getattr(args, "chat_id", None):
                         mem_pushed, mem_pulled = sync_memory(
                             service, subfolder_id, project_dir, args, indent="  ║   ",
+                            local_jsons=local_jsons, remote_files_map=remote_sub_files,
                         )
                     if pushed or pulled:
                         if args.dry_run:
@@ -1616,6 +1715,7 @@ def run_sync(args, service, root_folder_id):
                         if not getattr(args, "chat_id", None):
                             mem_pushed, mem_pulled = sync_memory(
                                 service, subfolder_id, project_dir, args, indent="  ║   ",
+                                local_jsons=local_jsons, remote_files_map=remote_sub_files,
                             )
                         if pushed or pulled:
                             if args.dry_run:
