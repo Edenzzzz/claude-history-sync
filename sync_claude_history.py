@@ -2417,7 +2417,12 @@ def main():
             print(f"Keepalive: {keepalive_method}")
             print(f"Stop: kill {pid}")
             pid_file.write_text(str(pid))
-            sys.exit(0)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            # Use os._exit to skip Python cleanup (atexit handlers, thread
+            # joins) that can race with the forked child and occasionally
+            # produce a non-zero exit code even when everything succeeded.
+            os._exit(0)
 
         # Child: detach and run daemon
         os.setsid()
