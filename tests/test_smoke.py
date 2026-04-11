@@ -258,6 +258,35 @@ class TestTrimCompact:
         assert abs(new_mtime - old_mtime) < 1, \
             f"mtime changed: was {old_mtime}, now {new_mtime}"
 
+    def test_idempotent(self, tmp_path):
+        """Re-trimming an already-trimmed file should be a no-op."""
+        import json
+        from sync_claude_history import trim_at_last_compact
+
+        p = tmp_path / "conv.jsonl"
+        entries = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "message": {"role": "user", "content": "hi"}},
+            {"type": "user", "uuid": "c1", "parentUuid": "u1",
+             "isCompactSummary": True,
+             "message": {"role": "user", "content": "summary"}},
+            {"type": "user", "uuid": "u2", "parentUuid": "c1",
+             "message": {"role": "user", "content": "after"}},
+        ]
+        with open(p, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        # First trim should reduce
+        trimmed1, _, _ = trim_at_last_compact(p)
+        assert trimmed1 is True
+        size_after_first = p.stat().st_size
+
+        # Second trim should be a no-op
+        trimmed2, b2, a2 = trim_at_last_compact(p)
+        assert trimmed2 is False
+        assert b2 == a2 == size_after_first
+
     def test_trim_no_compact(self, tmp_path):
         """File without a compact summary is left untouched."""
         import json

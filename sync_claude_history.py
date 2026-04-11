@@ -867,6 +867,17 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     if compact_idx < leading_summary_end:
         return False, before_size, before_size
 
+    # Idempotency check: if the compact entry is already the first
+    # non-summary line and its parentUuid is already None, the file is
+    # already trimmed and nothing needs to change. Skip the rewrite to
+    # avoid churning mtime/md5 every sync cycle.
+    if (compact_idx == leading_summary_end
+            and parsed[compact_idx].get("parentUuid") is None):
+        # Make sure no entries beyond compact_idx are missing/parsed=None
+        # (we already include them all on rewrite, so a no-op rewrite would
+        # produce identical bytes — bail out).
+        return False, before_size, before_size
+
     compact_entry = parsed[compact_idx]
     compact_entry = dict(compact_entry)
     compact_entry["parentUuid"] = None
