@@ -777,6 +777,129 @@ def is_empty_conversation(jsonl_path: Path) -> bool:
     return True
 
 
+def _file_has_compact_marker(jsonl_path: Path) -> bool:
+    """Fast check for the ``isCompactSummary`` marker in a file (bytes-level).
+
+    Avoids parsing the entire JSONL on every sync when the file has no
+    compact point (the common case for fresh conversations).
+    """
+    needle = b'"isCompactSummary"'
+    try:
+        with open(jsonl_path, "rb") as f:
+            # Read in chunks so we don't slurp huge files
+            overlap = b""
+            while True:
+                chunk = f.read(1 << 20)  # 1 MiB
+                if not chunk:
+                    return False
+                if needle in overlap + chunk:
+                    return True
+                # Keep last len(needle)-1 bytes as overlap for boundary matches
+                overlap = chunk[-(len(needle) - 1):]
+    except OSError:
+        return False
+
+
+def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
+    """Trim a conversation at the last ``isCompactSummary`` entry.
+
+    Keeps any leading ``type=summary`` entries (title metadata), the last
+    ``isCompactSummary`` entry itself (with its ``parentUuid`` patched to
+    ``None`` so it acts as the new root), and every entry that follows it.
+    Everything before the last compact point is discarded — that content is
+    already captured by the summary message itself, and dropping it lets
+    ``claude --resume`` load huge conversations that would otherwise exceed
+    the context window at load time.
+
+    A ``.pretrim.bak`` copy is written next to the file (only if one does not
+    already exist) before rewriting.
+
+    Returns ``(trimmed, before_bytes, after_bytes)``. When no compact point is
+    found, or the compact point is already at the top of the file, the file
+    is left untouched and ``trimmed`` is ``False``.
+    """
+    import shutil
+
+    # Fast path: no compact marker anywhere in the file
+    if not _file_has_compact_marker(jsonl_path):
+        try:
+            size = jsonl_path.stat().st_size
+        except OSError:
+            size = 0
+        return False, size, size
+
+    try:
+        with open(jsonl_path, "r") as f:
+            lines = f.readlines()
+    except (OSError, UnicodeDecodeError):
+        size = jsonl_path.stat().st_size
+        return False, size, size
+
+    parsed: list[dict | None] = [None] * len(lines)
+    compact_idx = -1
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        parsed[i] = d
+        if d.get("isCompactSummary") is True:
+            compact_idx = i
+
+    before_stat = jsonl_path.stat()
+    before_size = before_stat.st_size
+    before_mtime = before_stat.st_mtime
+    if compact_idx < 0:
+        return False, before_size, before_size
+
+    # Preserve leading contiguous block of ``type=summary`` entries
+    leading_summary_end = 0
+    for i, d in enumerate(parsed):
+        if d is None:
+            continue
+        if d.get("type") == "summary":
+            leading_summary_end = i + 1
+        else:
+            break
+
+    if compact_idx < leading_summary_end:
+        return False, before_size, before_size
+
+    compact_entry = parsed[compact_idx]
+    compact_entry = dict(compact_entry)
+    compact_entry["parentUuid"] = None
+
+    bak = jsonl_path.with_suffix(jsonl_path.suffix + ".pretrim.bak")
+    if not bak.exists():
+        shutil.copy2(jsonl_path, bak)
+
+    tmp = jsonl_path.with_suffix(jsonl_path.suffix + ".trim.tmp")
+    with open(tmp, "w") as f:
+        for i in range(leading_summary_end):
+            if parsed[i] is None:
+                continue
+            line = lines[i]
+            f.write(line if line.endswith("\n") else line + "\n")
+        f.write(json.dumps(compact_entry, ensure_ascii=False) + "\n")
+        for i in range(compact_idx + 1, len(lines)):
+            if not lines[i].strip():
+                continue
+            line = lines[i]
+            f.write(line if line.endswith("\n") else line + "\n")
+
+    tmp.replace(jsonl_path)
+    # Preserve original mtime so that auto-trim during sync does not flip the
+    # push/pull direction for conversations that haven't actually been updated.
+    try:
+        os.utime(jsonl_path, (before_stat.st_atime, before_mtime))
+    except OSError:
+        pass
+    after_size = jsonl_path.stat().st_size
+    return True, before_size, after_size
+
+
 def local_file_md5(path: Path) -> str:
     h = hashlib.md5()
     with open(path, "rb") as f:
@@ -924,6 +1047,27 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
         local_jsons = {k: v for k, v in local_jsons.items()
                        if any(k.startswith(c) for c in chat_filters)}
 
+    # Auto-trim any local conversations at their last /compact point before
+    # comparing against the remote. Claude Code's resume loader walks the whole
+    # JSONL, so conversations that have been compacted keep piling up unusable
+    # pre-compaction history — drop it now so the pushed version is also small
+    # everywhere else the file gets synced to. Original mtime is preserved so
+    # the sync direction is not flipped; files that were trimmed go in
+    # ``just_trimmed`` so they still get pushed when mtimes are equal.
+    just_trimmed = set()
+    if not args.dry_run:
+        for fname, local_path in list(local_jsons.items()):
+            try:
+                trimmed, before, after = trim_at_last_compact(local_path)
+            except (OSError, ValueError):
+                continue
+            if trimmed:
+                just_trimmed.add(fname)
+                saved_pct = 100 * (before - after) / before if before else 0
+                print(f"{indent}[TRIMMED] {fname} "
+                      f"{format_size(before)} → {format_size(after)} "
+                      f"(-{saved_pct:.1f}%)")
+
     pushed = pulled = skipped = 0
 
     # Load/create titles mapping: {session_id: title}
@@ -957,11 +1101,17 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
 
             if local_mtime > remote_mtime and not args.pull_only:
                 # Guard: if local is newer but much smaller (<=95% of remote),
-                # the local file was likely overwritten/corrupted — pull remote instead
-                if remote_size > 0 and local_size <= remote_size * 0.95:
+                # the local file was likely overwritten/corrupted — pull remote instead.
+                # Skip this guard for compacted-then-trimmed files: they are
+                # *expected* to be much smaller than the remote since the remote
+                # still has pre-compaction history. Let the push replace it.
+                local_is_trimmed_compact = _file_has_compact_marker(local_path)
+                if (remote_size > 0 and local_size <= remote_size * 0.95
+                        and not local_is_trimmed_compact):
                     action = "WOULD PULL (local shrunk)" if args.dry_run else "PULLED (local shrunk)"
                     if not args.dry_run:
                         download_file(service, remote["id"], local_path)
+                        trim_at_last_compact(local_path)
                     print(f"{indent}[{action}] {fname} ({format_size(remote_size)} remote > {format_size(local_size)} local)")
                     pulled += 1
                 else:
@@ -975,8 +1125,18 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
                 action = "WOULD PULL" if args.dry_run else "PULLED"
                 if not args.dry_run:
                     download_file(service, remote["id"], local_path)
+                    trim_at_last_compact(local_path)
                 print(f"{indent}[{action}] {fname} ({format_size(remote_size)}, {format_time(remote_mtime)})")
                 pulled += 1
+            elif fname in just_trimmed and not args.pull_only:
+                # Trimmed locally but mtimes are equal — push the smaller
+                # version so every other machine also picks up the trim.
+                action = "WOULD PUSH (trimmed)" if args.dry_run else "PUSHED (trimmed)"
+                if not args.dry_run:
+                    media = MediaFileUpload(str(local_path))
+                    service.files().update(fileId=remote["id"], media_body=media).execute()
+                print(f"{indent}[{action}] {fname} ({format_size(local_size)}, {format_time(local_mtime)})")
+                pushed += 1
             else:
                 skipped += 1
         elif not args.pull_only:
@@ -1015,6 +1175,7 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
                 action = "WOULD PULL NEW" if args.dry_run else "PULLED NEW"
                 if not args.dry_run:
                     download_file(service, remote["id"], local_dir / fname)
+                    trim_at_last_compact(local_dir / fname)
                     # Inject saved title into the downloaded conversation
                     session_id = fname.replace(".jsonl", "")
                     saved_title = remote_titles.get(session_id)
@@ -2208,34 +2369,35 @@ def main():
                 pid_file.unlink(missing_ok=True)
 
         if daemon_alive:
-            # Kill any orphaned sync processes (not the current daemon or its children)
-            try:
-                result = subprocess.run(
-                    ["pgrep", "-f", "sync_claude_history.py --background"],
-                    capture_output=True, text=True,
-                )
-                keep = {str(old_pid), str(os.getpid())}
-                for child in subprocess.run(
-                    ["pgrep", "-P", str(old_pid)], capture_output=True, text=True
-                ).stdout.strip().split("\n"):
-                    if child.strip():
-                        keep.add(child.strip())
-                for p in result.stdout.strip().split("\n"):
-                    if p.strip() and p.strip() not in keep:
-                        try:
-                            os.kill(int(p), 9)
-                        except (ProcessLookupError, ValueError):
-                            pass
-            except (FileNotFoundError, OSError):
-                pass
-            for msg in added_jobs:
-                print(msg)
-            print(f"Daemon already running (PID {old_pid}), will pick up changes on next cycle")
-            print(f"Log: {log_file}")
-            sys.exit(0)
+            print(f"Stopping existing daemon (PID {old_pid}) to pick up new code…")
 
-        # Kill any orphaned daemon processes before starting a new one
+        # Always kill the existing daemon (if any) and orphaned workers,
+        # so that rerunning --background picks up new code without the user
+        # having to kill the process manually.
         _kill_existing_daemon(pid_file, jobs_file)
+
+        # Sweep any other orphaned sync processes not under the tracked PID
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "sync_claude_history.py --background"],
+                capture_output=True, text=True,
+            )
+            self_pid = os.getpid()
+            for p in result.stdout.strip().split("\n"):
+                if not p.strip():
+                    continue
+                try:
+                    pid_val = int(p)
+                except ValueError:
+                    continue
+                if pid_val == self_pid:
+                    continue
+                try:
+                    os.kill(pid_val, 9)
+                except (ProcessLookupError, ValueError, OSError):
+                    pass
+        except (FileNotFoundError, OSError):
+            pass
 
         # Set up keepalive (cron preferred, watchdog fallback)
         keepalive_script = SCRIPT_DIR / "keepalive.sh"

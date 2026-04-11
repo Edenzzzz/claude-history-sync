@@ -100,9 +100,23 @@ python sync_claude_history.py --background 60 --repo flash     # 🔁 custom int
 python sync_claude_history.py --merge fdd460 de1128            # 🔗 merge conversations
 ```
 
+### Auto-trim at last compact
+
+Every push/pull automatically drops pre-`/compact` history from any
+conversation that has been compacted. The compact summary message itself is
+kept (so Claude still has the full-history recap on `--resume`) and the
+parent chain is rewired to make it the new root. This keeps oversized chats
+loadable without any flag — once any machine syncs a compacted conversation,
+every other machine gets the trimmed version too. A `.pretrim.bak` is written
+locally the first time a file is trimmed, and the original mtime is preserved
+so sync direction is unaffected.
+
 ### Background sync
 
-Auto-forks a single daemon process. Multiple `--background` calls add/update jobs — no duplicate processes:
+Auto-forks a single daemon process. Each `--background` call kills the running
+daemon (if any) and relaunches it with the merged job list, so pulling a new
+version of the script and rerunning `--background` is enough to pick up code
+changes — no need to `kill` anything manually first.
 
 ```bash
 # Start daemon with a repo (default: every 10 min)
@@ -111,14 +125,16 @@ python sync_claude_history.py --background --repo flashinfer
 #   [flashinfer:all] every 600s
 # PID: 12345
 
-# Add another repo (same daemon picks it up)
+# Add another repo (restarts daemon with both jobs)
 python sync_claude_history.py --background --repo sglang
-# Added job [sglang:all]: every 600s
-# Daemon already running (PID 12345), will pick up changes on next cycle
+# Stopping existing daemon (PID 12345) to pick up new code…
+# Background daemon started with 2 job(s):
+#   [flashinfer:all] every 600s
+#   [sglang:all] every 600s
 
 # Update interval for existing job
 python sync_claude_history.py --background 60 --repo flashinfer
-# Updated job [flashinfer:all]: interval 600s -> 60s
+# Updated [flashinfer:all]: 600s -> 60s
 
 tail -f sync.log      # watch live log
 kill $(cat .sync.pid) # stop daemon

@@ -17,6 +17,8 @@
 - Fix zombie daemon processes by killing PID tree before starting new daemon
 - Auto-create Claude project dir instead of crashing when it doesn't exist
 - Make memory sync chat-specific on Drive using `originSessionId` frontmatter (Drive structure: `_memory/<chat_id>/*.md`), auto-migrate legacy flat memory files to largest chat
+- Auto-trim conversations at their last `/compact` point on every push/pull — keeps only the compact summary message and everything after it, so oversized chats become small enough for `claude --resume` to load. Original mtime is preserved so sync direction is unchanged; a `.pretrim.bak` is written the first time a file is trimmed.
+- `--background` now always kills and restarts the existing daemon so code changes get picked up without manually stopping it first
 
 ## v0.1.6
 
