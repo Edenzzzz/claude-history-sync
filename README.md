@@ -100,6 +100,16 @@ python sync_claude_history.py --background 60 --repo flash     # 🔁 custom int
 python sync_claude_history.py --merge fdd460 de1128            # 🔗 merge conversations
 ```
 
+### Auto-cwd rewrite on pull
+
+Claude Code stores the absolute `cwd` of the directory where each turn was
+recorded inside every JSONL entry, and `claude --resume` refuses to load a
+conversation whose `cwd` doesn't match the current working directory. On
+pull, the script rewrites every entry's `cwd` to the *local* project dir's
+path — so if the repo lives at `/repo/path` on one machine and
+`/home/user/repo` on another, `--resume` works from the right place on both.
+The rewrite preserves mtime so it doesn't churn push/pull direction.
+
 ### Auto-trim at last compact
 
 Every push/pull automatically drops pre-`/compact` history from any

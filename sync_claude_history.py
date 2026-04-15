@@ -911,6 +911,88 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     return True, before_size, after_size
 
 
+def _first_cwd_in_file(jsonl_path: Path) -> str | None:
+    """Return the first ``cwd`` value found in the file, or ``None``."""
+    try:
+        with open(jsonl_path, "r") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "cwd" in d:
+                    return d["cwd"]
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None
+
+
+def rewrite_cwd_if_needed(jsonl_path: Path, local_cwd: str) -> int:
+    """Rewrite every entry's ``cwd`` field to ``local_cwd`` when it differs.
+
+    Conversations synced across machines carry the original machine's absolute
+    cwd (e.g. ``/sgl-workspace/claude-history-sync``) in every entry. Claude
+    Code's ``--resume`` refuses to load a conversation whose cwd doesn't match
+    the current working directory, so on any machine where the same repo lives
+    at a different path the resume would fail with
+    *"This conversation is from a different directory"*. Rewriting the cwd to
+    the local project path on pull fixes that.
+
+    Original mtime is preserved so this rewrite does not flip the push/pull
+    direction or trigger spurious pushes on the next sync cycle.
+
+    Returns the number of entries rewritten (0 if nothing changed).
+    """
+    if not local_cwd:
+        return 0
+
+    # Fast path: if the first entry with a cwd already matches ``local_cwd``,
+    # assume the whole file is aligned (Claude Code writes a consistent cwd per
+    # session). Skips the full JSON parse on every sync.
+    first = _first_cwd_in_file(jsonl_path)
+    if first is None or first == local_cwd:
+        return 0
+
+    try:
+        with open(jsonl_path, "r") as f:
+            lines = f.readlines()
+    except (OSError, UnicodeDecodeError):
+        return 0
+
+    rewrote = 0
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            new_lines.append(line)
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            new_lines.append(line)
+            continue
+        if "cwd" in d and d["cwd"] != local_cwd:
+            d["cwd"] = local_cwd
+            rewrote += 1
+            new_lines.append(json.dumps(d, ensure_ascii=False) + "\n")
+        else:
+            new_lines.append(line)
+
+    if rewrote == 0:
+        return 0
+
+    try:
+        before_stat = jsonl_path.stat()
+        with open(jsonl_path, "w") as f:
+            f.writelines(new_lines)
+        os.utime(jsonl_path, (before_stat.st_atime, before_stat.st_mtime))
+    except OSError:
+        return 0
+    return rewrote
+
+
 def local_file_md5(path: Path) -> str:
     h = hashlib.md5()
     with open(path, "rb") as f:
@@ -1058,6 +1140,25 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
         local_jsons = {k: v for k, v in local_jsons.items()
                        if any(k.startswith(c) for c in chat_filters)}
 
+    # Resolve this local project dir back to its absolute cwd so we can
+    # rewrite cwd fields on pull (the pulled JSONL may carry a different
+    # machine's absolute path, which would make ``claude --resume`` refuse).
+    local_cwd = resolve_claude_project_path(local_dir.name)
+
+    # Rewrite cwd fields on any existing local file whose entries still carry
+    # another machine's cwd. This runs every sync so it self-heals files that
+    # landed here from an older sync version. mtime is preserved inside
+    # rewrite_cwd_if_needed so this doesn't flip the sync direction.
+    if not args.dry_run and local_cwd:
+        for fname, local_path in list(local_jsons.items()):
+            try:
+                n = rewrite_cwd_if_needed(local_path, local_cwd)
+            except (OSError, ValueError):
+                continue
+            if n:
+                print(f"{indent}[CWD REWRITE] {fname} "
+                      f"({n} entries → {local_cwd})")
+
     # Auto-trim any local conversations at their last /compact point before
     # comparing against the remote. Claude Code's resume loader walks the whole
     # JSONL, so conversations that have been compacted keep piling up unusable
@@ -1123,6 +1224,8 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
                     if not args.dry_run:
                         download_file(service, remote["id"], local_path)
                         trim_at_last_compact(local_path)
+                        if local_cwd:
+                            rewrite_cwd_if_needed(local_path, local_cwd)
                     print(f"{indent}[{action}] {fname} ({format_size(remote_size)} remote > {format_size(local_size)} local)")
                     pulled += 1
                 else:
@@ -1187,6 +1290,8 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
                 if not args.dry_run:
                     download_file(service, remote["id"], local_dir / fname)
                     trim_at_last_compact(local_dir / fname)
+                    if local_cwd:
+                        rewrite_cwd_if_needed(local_dir / fname, local_cwd)
                     # Inject saved title into the downloaded conversation
                     session_id = fname.replace(".jsonl", "")
                     saved_title = remote_titles.get(session_id)

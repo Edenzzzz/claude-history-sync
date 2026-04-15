@@ -287,6 +287,46 @@ class TestTrimCompact:
         assert trimmed2 is False
         assert b2 == a2 == size_after_first
 
+    def test_cwd_rewrite(self, tmp_path):
+        """rewrite_cwd_if_needed updates all cwd fields and preserves mtime."""
+        import json
+        import os
+        import time
+        from sync_claude_history import rewrite_cwd_if_needed
+
+        p = tmp_path / "conv.jsonl"
+        entries = [
+            {"type": "user", "uuid": "u1", "cwd": "/orig/repo",
+             "message": {"role": "user", "content": "hi"}},
+            {"type": "assistant", "uuid": "a1", "cwd": "/orig/repo",
+             "message": {"role": "assistant", "content": "hello"}},
+            # Entry without cwd — should be left untouched
+            {"type": "summary", "summary": "a title"},
+            {"type": "user", "uuid": "u2", "cwd": "/orig/repo",
+             "message": {"role": "user", "content": "more"}},
+        ]
+        with open(p, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        old_mtime = time.time() - 12345
+        os.utime(p, (old_mtime, old_mtime))
+
+        n = rewrite_cwd_if_needed(p, "/local/repo")
+        assert n == 3
+
+        with open(p) as f:
+            after = [json.loads(l) for l in f if l.strip()]
+        assert after[0]["cwd"] == "/local/repo"
+        assert after[1]["cwd"] == "/local/repo"
+        assert "cwd" not in after[2]  # summary entry unchanged
+        assert after[3]["cwd"] == "/local/repo"
+
+        # mtime preserved
+        assert abs(p.stat().st_mtime - old_mtime) < 1
+
+        # Second call is a no-op (returns 0)
+        assert rewrite_cwd_if_needed(p, "/local/repo") == 0
+
     def test_trim_no_compact(self, tmp_path):
         """File without a compact summary is left untouched."""
         import json
