@@ -2,6 +2,8 @@
 
 ## v0.1.7
 
+- **Fix trim breaking Claude Code resume**: preserve original `parentUuid` on compaction entries (dangling ref is how CC detects the trim boundary); reconnect post-trim entries with orphaned parentUuids to the compact entry
+- Self-heal background jobs with `repo: null` / partial chat IDs via lazy-resolve in the daemon loop; `resolve_chat_id` dedupes duplicate session-ID matches across project dirs
 - Add DNS-over-HTTPS fallback when googleapis.com is unreachable via local DNS (patches socket + httplib2)
 - Speed up sync by batching Google Drive API calls (`batch_list_remote_files`, `batch_list_drive_folders`)
 - Store raw git URL in folder `description` to skip metadata file downloads on subsequent runs

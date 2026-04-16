@@ -218,7 +218,7 @@ class TestTrimCompact:
             lines = [json.loads(l) for l in f if l.strip()]
         assert len(lines) == 3
         assert lines[0].get("isCompactSummary") is True
-        assert lines[0]["parentUuid"] is None
+        assert lines[0]["parentUuid"] == "u2"  # original parent preserved (dangling OK)
         assert lines[0]["uuid"] == "c1"
         assert lines[1]["uuid"] == "u3"
         assert lines[1]["parentUuid"] == "c1"  # chain intact

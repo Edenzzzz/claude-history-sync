@@ -868,23 +868,51 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
         return False, before_size, before_size
 
     # Idempotency check: if the compact entry is already the first
-    # non-summary line and its parentUuid is already None, the file is
-    # already trimmed and nothing needs to change. Skip the rewrite to
-    # avoid churning mtime/md5 every sync cycle.
-    if (compact_idx == leading_summary_end
-            and parsed[compact_idx].get("parentUuid") is None):
-        # Make sure no entries beyond compact_idx are missing/parsed=None
-        # (we already include them all on rewrite, so a no-op rewrite would
-        # produce identical bytes — bail out).
+    # non-summary line, the file is already trimmed and nothing needs to
+    # change.  Skip the rewrite to avoid churning mtime/md5 every sync cycle.
+    if compact_idx == leading_summary_end:
         return False, before_size, before_size
 
     compact_entry = parsed[compact_idx]
     compact_entry = dict(compact_entry)
-    compact_entry["parentUuid"] = None
+    # Keep the original parentUuid — a dangling reference to a removed entry
+    # is fine.  Nulling it out breaks Claude Code's tree-walking on resume:
+    # CC treats parentUuid=None as a brand-new session root and creates a
+    # disconnected branch instead of loading the compaction summary.
 
     bak = jsonl_path.with_suffix(jsonl_path.suffix + ".pretrim.bak")
     if not bak.exists():
         shutil.copy2(jsonl_path, bak)
+
+    # Collect UUIDs that will survive the trim (compact entry + everything
+    # after it, plus leading summaries).
+    surviving_uuids = set()
+    for i in range(leading_summary_end):
+        if parsed[i] is not None:
+            u = parsed[i].get("uuid")
+            if u:
+                surviving_uuids.add(u)
+    surviving_uuids.add(compact_entry.get("uuid", ""))
+    for i in range(compact_idx + 1, len(parsed)):
+        if parsed[i] is not None:
+            u = parsed[i].get("uuid")
+            if u:
+                surviving_uuids.add(u)
+
+    # Fix dangling parentUuids: entries after the compact point whose parent
+    # was in the trimmed portion.  Reconnect them to the compact entry so the
+    # conversation tree stays fully connected for Claude Code's resume.
+    compact_uuid = compact_entry.get("uuid")
+    fixed_lines: dict[int, str] = {}   # line_idx -> rewritten JSON line
+    for i in range(compact_idx + 1, len(parsed)):
+        d = parsed[i]
+        if d is None:
+            continue
+        parent = d.get("parentUuid")
+        if parent and parent not in surviving_uuids:
+            d = dict(d)
+            d["parentUuid"] = compact_uuid
+            fixed_lines[i] = json.dumps(d, ensure_ascii=False) + "\n"
 
     tmp = jsonl_path.with_suffix(jsonl_path.suffix + ".trim.tmp")
     with open(tmp, "w") as f:
@@ -897,8 +925,11 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
         for i in range(compact_idx + 1, len(lines)):
             if not lines[i].strip():
                 continue
-            line = lines[i]
-            f.write(line if line.endswith("\n") else line + "\n")
+            if i in fixed_lines:
+                f.write(fixed_lines[i])
+            else:
+                line = lines[i]
+                f.write(line if line.endswith("\n") else line + "\n")
 
     tmp.replace(jsonl_path)
     # Preserve original mtime so that auto-trim during sync does not flip the
