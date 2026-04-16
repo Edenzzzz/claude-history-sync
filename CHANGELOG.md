@@ -17,6 +17,7 @@
 - Fix zombie daemon processes by killing PID tree before starting new daemon
 - Auto-create Claude project dir instead of crashing when it doesn't exist
 - Make memory sync chat-specific on Drive using `originSessionId` frontmatter (Drive structure: `_memory/<chat_id>/*.md`), auto-migrate legacy flat memory files to largest chat
+- Self-heal background job entries with `repo: null` / partial chat IDs: the daemon now lazy-resolves the chat ID at each cycle and rewrites the job under its canonical `<repo>:<full-uuid>` key once locally resolvable. `resolve_chat_id` also dedupes duplicate session-ID matches across project dirs (prefers the largest git-rooted copy).
 - Auto-rewrite `cwd` fields on pull to the local project dir's path, so `claude --resume` no longer fails with *"This conversation is from a different directory"* on machines where the repo lives at a different path (mtime preserved to avoid sync churn)
 - Auto-trim conversations at their last `/compact` point on every push/pull — keeps only the compact summary message and everything after it, so oversized chats become small enough for `claude --resume` to load. Original mtime is preserved so sync direction is unchanged; a `.pretrim.bak` is written the first time a file is trimmed.
 - `--background` now always kills and restarts the existing daemon so code changes get picked up without manually stopping it first

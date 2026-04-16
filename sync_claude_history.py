@@ -1082,24 +1082,46 @@ def inject_custom_title(jsonl_path: Path, session_id: str, title: str):
 def resolve_chat_id(prefix: str) -> tuple[str, str | None]:
     """Resolve a chat ID prefix to (full_session_id, repo_url).
 
-    Returns (prefix, None) if no unique match."""
-    matches = []  # (session_id, project_dir)
+    If multiple files match the prefix (e.g. the same session ID was synced
+    into more than one project dir by a past sync bug), dedupe by session ID
+    and pick the (project_dir, raw_url) of the largest file — that's the one
+    Claude Code would actually use from its canonical location.
+
+    Returns (prefix, None) if the session ID cannot be uniquely resolved.
+    """
+    matches = []  # (session_id, project_dir, size)
     for project_dir in CLAUDE_PROJECTS_DIR.iterdir():
         if not project_dir.is_dir():
             continue
         for f in project_dir.glob(f"{prefix}*.jsonl"):
-            matches.append((f.stem, project_dir))
-    if len(matches) != 1:
+            try:
+                size = f.stat().st_size
+            except OSError:
+                size = 0
+            matches.append((f.stem, project_dir, size))
+    if not matches:
         return prefix, None
-    session_id, project_dir = matches[0]
-    # Resolve project dir to git remote URL
-    local_path = resolve_claude_project_path(project_dir.name)
-    if local_path:
+
+    # If multiple matches but they all share the same session ID, pick the
+    # project dir whose file is largest (usually the canonical copy).
+    unique_ids = {m[0] for m in matches}
+    if len(unique_ids) != 1:
+        return prefix, None
+
+    session_id = next(iter(unique_ids))
+    # Prefer a match whose project dir resolves to a git-rooted path; among
+    # those, pick the largest file.
+    candidates = sorted(matches, key=lambda m: -m[2])
+    for _, project_dir, _ in candidates:
+        local_path = resolve_claude_project_path(project_dir.name)
+        if not local_path:
+            continue
         git_root = find_git_root(local_path)
-        if git_root:
-            raw_url = get_git_remote(git_root)
-            if raw_url:
-                return session_id, raw_url
+        if not git_root:
+            continue
+        raw_url = get_git_remote(git_root)
+        if raw_url:
+            return session_id, raw_url
     return session_id, None
 
 
@@ -2278,6 +2300,36 @@ def _run_daemon_loop(pid_file, jobs_file, service, root_folder_id):
                 effective_interval = min(job_interval * (2 ** failures), job_interval * 4)
                 if now - last_run.get(job_key, 0) < effective_interval:
                     continue
+
+                # Lazy-resolve stale jobs: jobs added when the chat ID wasn't
+                # yet locally resolvable carry ``repo: null`` and a partial
+                # chat_id. Try to fully resolve them now — if we can, rewrite
+                # the job under its canonical key so it stops showing up as
+                # ``all:<prefix>`` in future runs.
+                job_repo = job.get("repo")
+                job_chat = job.get("chat_id")
+                if (not job_repo or (job_chat and len(job_chat) < 36)) and job_chat:
+                    full_chat, chat_repo = resolve_chat_id(job_chat)
+                    new_repo = job_repo or chat_repo
+                    new_chat = full_chat if len(full_chat) == 36 else job_chat
+                    if (new_repo, new_chat) != (job_repo, job_chat):
+                        new_key = f"{new_repo or 'all'}:{new_chat or 'all'}"
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"[{timestamp}] Resolved job [{job_key}] → [{new_key}]",
+                              flush=True)
+                        jobs[new_key] = {
+                            "repo": new_repo,
+                            "chat_id": new_chat,
+                            "interval": job_interval,
+                        }
+                        if new_key != job_key:
+                            jobs.pop(job_key, None)
+                        try:
+                            jobs_file.write_text(json.dumps(jobs, indent=2))
+                        except OSError:
+                            pass
+                        job = jobs[new_key]
+                        job_key = new_key
 
                 job_args = argparse.Namespace(
                     pull_only=False, push_only=False, delete=False,
