@@ -1156,6 +1156,26 @@ def resolve_chat_id(prefix: str) -> tuple[str, str | None]:
     return session_id, None
 
 
+def get_chat_name_by_id(chat_id: str | None) -> str | None:
+    """Find the largest jsonl matching chat_id across project dirs and return its title."""
+    if not chat_id:
+        return None
+    best = None  # (size, path)
+    for project_dir in CLAUDE_PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for f in project_dir.glob(f"{chat_id}*.jsonl"):
+            try:
+                size = f.stat().st_size
+            except OSError:
+                continue
+            if best is None or size > best[0]:
+                best = (size, f)
+    if best is None:
+        return None
+    return get_conversation_title(best[1])
+
+
 def resolve_repo_filter(repo_filter: str) -> str:
     """Resolve a repo substring filter to the full git remote URL. Returns filter if no unique match."""
     index = build_local_index()
@@ -2351,6 +2371,7 @@ def _run_daemon_loop(pid_file, jobs_file, service, root_folder_id):
                         jobs[new_key] = {
                             "repo": new_repo,
                             "chat_id": new_chat,
+                            "name": get_chat_name_by_id(new_chat),
                             "interval": job_interval,
                         }
                         if new_key != job_key:
@@ -2549,6 +2570,7 @@ def main():
                     jobs[job_key] = {
                         "repo": full_repo,
                         "chat_id": full_chat,
+                        "name": get_chat_name_by_id(full_chat),
                         "interval": interval,
                     }
                     if old_interval is not None:

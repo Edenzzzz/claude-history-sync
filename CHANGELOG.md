@@ -2,7 +2,8 @@
 
 ## v0.1.7
 
-- Add `check_background.sh` to verify the sync daemon process is alive via `ps -aux` + pid from `.sync_jobs.json`
+- Add `check_background.sh` to verify the sync daemon process is alive via `ps -aux` + pid from `.sync_jobs.json`, and print configured jobs (repo, chat name, chat ID, interval)
+- Store resolved chat `name` (custom title or slug) alongside each `.sync_jobs.json` entry
 - **Fix trim breaking Claude Code resume**: preserve original `parentUuid` on compaction entries (dangling ref is how CC detects the trim boundary); reconnect post-trim entries with orphaned parentUuids to the compact entry
 - Self-heal background jobs with `repo: null` / partial chat IDs via lazy-resolve in the daemon loop; `resolve_chat_id` dedupes duplicate session-ID matches across project dirs
 - Add DNS-over-HTTPS fallback when googleapis.com is unreachable via local DNS (patches socket + httplib2)
