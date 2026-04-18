@@ -1287,12 +1287,14 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
             if local_mtime > remote_mtime and not args.pull_only:
                 # Guard: if local is newer but much smaller (<=95% of remote),
                 # the local file was likely overwritten/corrupted — pull remote instead.
-                # Skip this guard for compacted-then-trimmed files: they are
-                # *expected* to be much smaller than the remote since the remote
-                # still has pre-compaction history. Let the push replace it.
-                local_is_trimmed_compact = _file_has_compact_marker(local_path)
+                # Only skip this guard for files trimmed in THIS sync cycle
+                # (just_trimmed). Don't use _file_has_compact_marker here —
+                # the marker persists from previous trims, so Claude Code's
+                # auto-compaction (which shrinks the file without our trim)
+                # would bypass the guard and push the smaller file, destroying
+                # the larger remote.
                 if (remote_size > 0 and local_size <= remote_size * 0.95
-                        and not local_is_trimmed_compact):
+                        and fname not in just_trimmed):
                     action = "WOULD PULL (local shrunk)" if args.dry_run else "PULLED (local shrunk)"
                     if not args.dry_run:
                         download_file(service, remote["id"], local_path)

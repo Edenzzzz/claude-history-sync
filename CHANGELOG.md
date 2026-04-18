@@ -2,6 +2,7 @@
 
 ## v0.1.7
 
+- **Fix 95% size guard bypassed by stale compact markers**: the guard checked `_file_has_compact_marker` which persists from previous trims, so Claude Code's auto-compaction would shrink the file and bypass the guard, pushing the smaller version and destroying the larger remote. Now only skips the guard for files trimmed in the current sync cycle (`just_trimmed`)
 - Add `check_background.sh` to verify the sync daemon process is alive via `ps -aux` + pid from `.sync_jobs.json`, and print configured jobs (repo, chat name, chat ID, interval)
 - Store resolved chat `name` (custom title or slug) alongside each `.sync_jobs.json` entry
 - **Fix trim breaking Claude Code resume**: preserve original `parentUuid` on compaction entries (dangling ref is how CC detects the trim boundary); reconnect post-trim entries with orphaned parentUuids to the compact entry
