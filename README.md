@@ -97,6 +97,8 @@ python sync_claude_history.py -d --local --chat df9a     # 🗑️  delete local
 python sync_claude_history.py --background                     # 🔁 auto-sync in background
 python sync_claude_history.py --background --repo flash        # 🔁 auto-sync one repo
 python sync_claude_history.py --background 60 --repo flash     # 🔁 custom interval (60s)
+python sync_claude_history.py --remove-job --repo flash        # ❌ remove job from daemon
+python sync_claude_history.py --remove-job --chat df9a         # ❌ remove job by chat ID
 python sync_claude_history.py --merge fdd460 de1128            # 🔗 merge conversations
 ```
 
@@ -145,6 +147,11 @@ python sync_claude_history.py --background --repo sglang
 # Update interval for existing job
 python sync_claude_history.py --background 60 --repo flashinfer
 # Updated [flashinfer:all]: 600s -> 60s
+
+# Remove a job from the daemon
+python sync_claude_history.py --remove-job --repo flashinfer
+# Removed [flashinfer:all]
+# 1 job(s) remaining — restart with: python sync_claude_history.py --background
 
 tail -f sync.log      # watch live log
 kill $(cat .sync.pid) # stop daemon

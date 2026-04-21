@@ -2,6 +2,8 @@
 
 ## v0.1.7
 
+- Add `repair_uuid_chain`: auto-fix broken `parentUuid` links and strip duplicate/orphan uuid entries caused by Claude Code crashes and retries; runs on every sync cycle and after each pull so `claude --resume` can walk the full conversation chain
+- Add `--remove-job` flag to remove background sync jobs by `--repo` and/or `--chat` filter; kills daemon when no jobs remain
 - **Fix 95% size guard bypassed by stale compact markers**: the guard checked `_file_has_compact_marker` which persists from previous trims, so Claude Code's auto-compaction would shrink the file and bypass the guard, pushing the smaller version and destroying the larger remote. Now only skips the guard for files trimmed in the current sync cycle (`just_trimmed`)
 - Add `check_background.sh` to verify the sync daemon process is alive via `ps -aux` + pid from `.sync_jobs.json`, and print configured jobs (repo, chat name, chat ID, interval)
 - Store resolved chat `name` (custom title or slug) alongside each `.sync_jobs.json` entry

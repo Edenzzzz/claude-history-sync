@@ -5,6 +5,7 @@ Tests that don't need Drive (errors, local delete, background) skip the fixture.
 """
 
 import io
+import json
 import os
 import re
 import signal
@@ -41,6 +42,7 @@ def _parse_args(args_list):
     parser.add_argument("--repo", type=str, default=None)
     parser.add_argument("--chat", type=str, default=None, dest="chat_id")
     parser.add_argument("--background", type=int, nargs="?", const=600, default=None)
+    parser.add_argument("--remove-job", action="store_true")
     parser.add_argument("--merge", nargs=2, default=None)
     return parser.parse_args(args_list)
 
@@ -166,6 +168,60 @@ def _run_expect_fail(args):
     return r
 
 
+class TestRemoveJob:
+    def test_remove_by_repo(self, tmp_path):
+        jobs = {
+            "_daemon": {"pid": 99999},
+            "flashinfer:all": {"repo": "flashinfer", "chat_id": None, "interval": 600},
+            "sglang:all": {"repo": "sglang", "chat_id": None, "interval": 600},
+        }
+        jobs_file = tmp_path / ".sync_jobs.json"
+        jobs_file.write_text(json.dumps(jobs))
+        env = os.environ.copy()
+        env["SYNC_STATE_DIR"] = str(tmp_path)
+        r = subprocess.run(
+            ["python", "sync_claude_history.py", "--remove-job", "--repo", "flashinfer"],
+            capture_output=True, text=True, timeout=10, env=env,
+        )
+        assert r.returncode == 0, f"stderr: {r.stderr}\nstdout: {r.stdout}"
+        assert "Removed [flashinfer:all]" in r.stdout
+        assert "1 job(s) remaining" in r.stdout
+        remaining = json.loads(jobs_file.read_text())
+        assert "flashinfer:all" not in remaining
+        assert "sglang:all" in remaining
+
+    def test_remove_by_chat(self, tmp_path):
+        jobs = {
+            "_daemon": {},
+            "all:abc12345-full-uuid": {"repo": None, "chat_id": "abc12345-full-uuid", "interval": 600},
+        }
+        jobs_file = tmp_path / ".sync_jobs.json"
+        jobs_file.write_text(json.dumps(jobs))
+        env = os.environ.copy()
+        env["SYNC_STATE_DIR"] = str(tmp_path)
+        r = subprocess.run(
+            ["python", "sync_claude_history.py", "--remove-job", "--chat", "abc12345"],
+            capture_output=True, text=True, timeout=10, env=env,
+        )
+        assert r.returncode == 0, f"stderr: {r.stderr}\nstdout: {r.stdout}"
+        assert "Removed" in r.stdout
+        assert "No jobs remaining" in r.stdout
+        assert not jobs_file.exists()
+
+    def test_remove_no_match(self, tmp_path):
+        jobs = {"_daemon": {}, "sglang:all": {"repo": "sglang", "chat_id": None, "interval": 600}}
+        jobs_file = tmp_path / ".sync_jobs.json"
+        jobs_file.write_text(json.dumps(jobs))
+        env = os.environ.copy()
+        env["SYNC_STATE_DIR"] = str(tmp_path)
+        r = subprocess.run(
+            ["python", "sync_claude_history.py", "--remove-job", "--repo", "nonexistent"],
+            capture_output=True, text=True, timeout=10, env=env,
+        )
+        assert r.returncode == 0
+        assert "No matching" in r.stdout
+
+
 class TestErrors:
     def test_delete_requires_filter(self):
         _run_expect_fail(["-d"])
@@ -175,6 +231,9 @@ class TestErrors:
 
     def test_bad_background_interval(self):
         _run_expect_fail(["--background", "0"])
+
+    def test_remove_job_requires_filter(self):
+        _run_expect_fail(["--remove-job"])
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +385,136 @@ class TestTrimCompact:
 
         # Second call is a no-op (returns 0)
         assert rewrite_cwd_if_needed(p, "/local/repo") == 0
+
+    def test_repair_uuid_chain(self, tmp_path):
+        """repair_uuid_chain bridges broken parentUuid links."""
+        from sync_claude_history import repair_uuid_chain
+
+        p = tmp_path / "conv.jsonl"
+        entries = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "message": {"role": "user", "content": "start"}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+             "message": {"role": "assistant", "content": "ok"}},
+            {"type": "system", "uuid": "s1", "parentUuid": "a1"},
+            {"type": "queue-operation"},
+            # Break: parent points to uuid that was never written
+            {"type": "system", "uuid": "s2", "parentUuid": "MISSING-UUID"},
+            {"type": "user", "uuid": "u2", "parentUuid": "s2",
+             "message": {"role": "user", "content": "next"}},
+            {"type": "assistant", "uuid": "a2", "parentUuid": "u2",
+             "message": {"role": "assistant", "content": "done"}},
+        ]
+        with open(p, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        old_mtime = p.stat().st_mtime
+        n_fixes = repair_uuid_chain(p)
+        assert n_fixes == 1
+
+        with open(p) as f:
+            after = [json.loads(l) for l in f if l.strip()]
+        # s2 should now point to s1 (nearest preceding uuid'd line)
+        s2 = [e for e in after if e.get("uuid") == "s2"][0]
+        assert s2["parentUuid"] == "s1"
+        # chain should be fully walkable: a2 -> u2 -> s2 -> s1 -> a1 -> u1
+        uuid_map = {e["uuid"]: e for e in after if e.get("uuid")}
+        current = "a2"
+        chain = [current]
+        while uuid_map[current].get("parentUuid"):
+            current = uuid_map[current]["parentUuid"]
+            chain.append(current)
+        assert chain == ["a2", "u2", "s2", "s1", "a1", "u1"]
+
+        # mtime preserved
+        assert abs(p.stat().st_mtime - old_mtime) < 1
+
+    def test_repair_no_breaks(self, tmp_path):
+        """repair_uuid_chain returns 0 on an intact chain."""
+        from sync_claude_history import repair_uuid_chain
+
+        p = tmp_path / "conv.jsonl"
+        entries = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "message": {"role": "user", "content": "hi"}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+             "message": {"role": "assistant", "content": "hello"}},
+        ]
+        with open(p, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        assert repair_uuid_chain(p) == 0
+
+    def test_repair_multiple_breaks(self, tmp_path):
+        """repair_uuid_chain fixes multiple breaks in one pass."""
+        from sync_claude_history import repair_uuid_chain
+
+        p = tmp_path / "conv.jsonl"
+        entries = [
+            {"type": "user", "uuid": "u1", "parentUuid": None},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1"},
+            {"type": "system", "uuid": "s1", "parentUuid": "MISSING1"},
+            {"type": "user", "uuid": "u2", "parentUuid": "s1"},
+            {"type": "assistant", "uuid": "a2", "parentUuid": "u2"},
+            {"type": "system", "uuid": "s2", "parentUuid": "MISSING2"},
+            {"type": "user", "uuid": "u3", "parentUuid": "s2"},
+        ]
+        with open(p, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        n_fixes = repair_uuid_chain(p)
+        assert n_fixes == 2
+
+        with open(p) as f:
+            after = [json.loads(l) for l in f if l.strip()]
+        uuid_map = {e["uuid"]: e for e in after if e.get("uuid")}
+        assert uuid_map["s1"]["parentUuid"] == "a1"
+        assert uuid_map["s2"]["parentUuid"] == "a2"
+
+    def test_repair_dedup_orphan_branches(self, tmp_path):
+        """repair_uuid_chain removes duplicate uuid entries from orphan branches."""
+        from sync_claude_history import repair_uuid_chain
+
+        p = tmp_path / "conv.jsonl"
+        entries = [
+            # Orphan branch (old compacted start, same uuid as line 4)
+            {"type": "user", "uuid": "u1", "parentUuid": "DEAD",
+             "message": {"role": "user", "content": "old summary"}},
+            {"type": "assistant", "uuid": "a1-old", "parentUuid": "u1",
+             "message": {"role": "assistant", "content": "old reply"}},
+            # Metadata (no uuid)
+            {"type": "queue-operation"},
+            # Main branch
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "message": {"role": "user", "content": "real start"}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+             "message": {"role": "assistant", "content": "real reply"}},
+            {"type": "user", "uuid": "u2", "parentUuid": "a1",
+             "message": {"role": "user", "content": "continue"}},
+            # Trailing metadata
+            {"type": "custom-title"},
+        ]
+        with open(p, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        n_fixes = repair_uuid_chain(p)
+        assert n_fixes > 0
+
+        with open(p) as f:
+            after = [json.loads(l) for l in f if l.strip()]
+        # Orphan lines (old u1 and a1-old) should be removed
+        uuids = [e.get("uuid") for e in after if e.get("uuid")]
+        assert uuids == ["u1", "a1", "u2"]
+        # The remaining u1 should be the main branch one
+        u1 = [e for e in after if e.get("uuid") == "u1"][0]
+        assert u1["parentUuid"] is None
+        assert u1["message"]["content"] == "real start"
+        # Trailing metadata (custom-title) should be kept
+        assert any(e.get("type") == "custom-title" for e in after)
 
     def test_trim_no_compact(self, tmp_path):
         """File without a compact summary is left untouched."""

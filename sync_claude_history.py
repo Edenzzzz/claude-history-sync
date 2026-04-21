@@ -616,8 +616,11 @@ def build_local_index() -> dict:
             if cached_root and Path(cached_root).is_dir():
                 git_root = cached_root
                 git_url = get_git_remote(git_root)
-                fs_path = cached_root
                 rel_path_cached = cached.get("rel_path", ".")
+                # Skip gitignored paths even when the directory no longer exists
+                if is_gitignored(git_root, rel_path_cached):
+                    continue
+                fs_path = cached_root
                 if rel_path_cached != ".":
                     candidate = os.path.join(git_root, rel_path_cached)
                     if Path(candidate).is_dir():
@@ -942,6 +945,147 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     return True, before_size, after_size
 
 
+def repair_uuid_chain(jsonl_path: Path) -> int:
+    """Fix broken parentUuid links and remove orphan/duplicate entries.
+
+    Claude Code sometimes writes entries whose parentUuid points to a uuid that
+    was never persisted (e.g. after an ENOSPC crash or silent compaction), and
+    also writes duplicate uuid entries on retry/sidechain branches.  Duplicate
+    uuids cause CC's uuid→entry resolution to land on the wrong copy, making
+    ``claude --resume`` unable to walk the full conversation chain.
+
+    This function:
+    1. Repairs broken parentUuid links by bridging to the nearest preceding entry
+    2. Strips duplicate/orphan entries not on the main chain (reachable from tail)
+
+    Returns the number of fixes applied (0 means the file was already clean).
+    """
+    try:
+        with open(jsonl_path, "r") as f:
+            lines = f.readlines()
+    except (OSError, UnicodeDecodeError):
+        return 0
+
+    parsed: list[dict | None] = [None] * len(lines)
+    uuid_lines: dict[str, list[int]] = {}
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        parsed[i] = d
+        uid = d.get("uuid")
+        if uid:
+            uuid_lines.setdefault(uid, []).append(i)
+
+    if not uuid_lines:
+        return 0
+
+    # Use last occurrence for resolution (CC likely does the same)
+    uuid_to_line = {uid: indices[-1] for uid, indices in uuid_lines.items()}
+
+    # Phase 1: repair broken chain links
+    fixes = 0
+    while True:
+        if fixes > 0:
+            uuid_to_line = {uid: indices[-1] for uid, indices in uuid_lines.items()}
+
+        tail = len(lines) - 1
+        while tail >= 0 and (parsed[tail] is None or not parsed[tail].get("uuid")):
+            tail -= 1
+        if tail < 0:
+            break
+
+        broken_line = None
+        current = tail
+        visited: set[int] = set()
+        while current is not None and current not in visited:
+            visited.add(current)
+            d = parsed[current]
+            parent = d.get("parentUuid") if d else None
+            if parent and parent in uuid_to_line:
+                current = uuid_to_line[parent]
+            elif parent and parent not in uuid_to_line and current > 0:
+                broken_line = current
+                break
+            else:
+                current = None
+
+        if broken_line is None:
+            break
+
+        bridge = broken_line - 1
+        while bridge >= 0 and (parsed[bridge] is None or not parsed[bridge].get("uuid")):
+            bridge -= 1
+        if bridge < 0:
+            break
+
+        d = dict(parsed[broken_line])
+        d["parentUuid"] = parsed[bridge]["uuid"]
+        parsed[broken_line] = d
+        lines[broken_line] = json.dumps(d, ensure_ascii=False) + "\n"
+        fixes += 1
+
+    # Phase 2: check for duplicate uuids
+    has_dupes = any(len(indices) > 1 for indices in uuid_lines.values())
+    if not has_dupes and fixes == 0:
+        return 0
+
+    if has_dupes:
+        # Walk main chain from tail
+        uuid_to_line = {uid: indices[-1] for uid, indices in uuid_lines.items()}
+        tail = len(lines) - 1
+        while tail >= 0 and (parsed[tail] is None or not parsed[tail].get("uuid")):
+            tail -= 1
+
+        main_chain: set[int] = set()
+        current = tail
+        visited_dedup: set[int] = set()
+        while current is not None and current not in visited_dedup:
+            visited_dedup.add(current)
+            main_chain.add(current)
+            obj = parsed[current]
+            parent = obj.get("parentUuid") if obj else None
+            if parent and parent in uuid_to_line:
+                current = uuid_to_line[parent]
+            else:
+                current = None
+
+        chain_root = min(main_chain) if main_chain else 0
+        keep: set[int] = set()
+        for i in range(len(lines)):
+            if i in main_chain:
+                keep.add(i)
+            elif parsed[i] is not None and not parsed[i].get("uuid"):
+                # Keep metadata entries (custom-title, file-history-snapshot, etc.)
+                # that are interspersed with the main chain
+                if i >= chain_root:
+                    keep.add(i)
+
+        removed = len(lines) - len(keep)
+        fixes += removed
+    else:
+        keep = None
+
+    if fixes == 0:
+        return 0
+
+    before_stat = jsonl_path.stat()
+    tmp = jsonl_path.with_suffix(jsonl_path.suffix + ".repair.tmp")
+    with open(tmp, "w") as f:
+        for i in (sorted(keep) if keep is not None else range(len(lines))):
+            line = lines[i]
+            f.write(line if line.endswith("\n") else line + "\n")
+    tmp.replace(jsonl_path)
+    try:
+        os.utime(jsonl_path, (before_stat.st_atime, before_stat.st_mtime))
+    except OSError:
+        pass
+    return fixes
+
+
 def _first_cwd_in_file(jsonl_path: Path) -> str | None:
     """Return the first ``cwd`` value found in the file, or ``None``."""
     try:
@@ -1253,6 +1397,16 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
                       f"{format_size(before)} → {format_size(after)} "
                       f"(-{saved_pct:.1f}%)")
 
+    if not args.dry_run:
+        for fname, local_path in list(local_jsons.items()):
+            try:
+                n_fixes = repair_uuid_chain(local_path)
+            except (OSError, ValueError):
+                continue
+            if n_fixes:
+                print(f"{indent}[REPAIRED] {fname} "
+                      f"({n_fixes} broken parentUuid link{'s' if n_fixes > 1 else ''})")
+
     pushed = pulled = skipped = 0
 
     # Load/create titles mapping: {session_id: title}
@@ -1299,6 +1453,7 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
                     if not args.dry_run:
                         download_file(service, remote["id"], local_path)
                         trim_at_last_compact(local_path)
+                        repair_uuid_chain(local_path)
                         if local_cwd:
                             rewrite_cwd_if_needed(local_path, local_cwd)
                     print(f"{indent}[{action}] {fname} ({format_size(remote_size)} remote > {format_size(local_size)} local)")
@@ -1315,6 +1470,7 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
                 if not args.dry_run:
                     download_file(service, remote["id"], local_path)
                     trim_at_last_compact(local_path)
+                    repair_uuid_chain(local_path)
                 print(f"{indent}[{action}] {fname} ({format_size(remote_size)}, {format_time(remote_mtime)})")
                 pulled += 1
             elif fname in just_trimmed and not args.pull_only:
@@ -1365,6 +1521,7 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
                 if not args.dry_run:
                     download_file(service, remote["id"], local_dir / fname)
                     trim_at_last_compact(local_dir / fname)
+                    repair_uuid_chain(local_dir / fname)
                     if local_cwd:
                         rewrite_cwd_if_needed(local_dir / fname, local_cwd)
                     # Inject saved title into the downloaded conversation
@@ -2489,6 +2646,8 @@ def main():
     parser.add_argument("--background", type=int, nargs="?", const=600, default=None,
                         metavar="SECONDS",
                         help="Run as background daemon, syncing every N seconds (default: 600)")
+    parser.add_argument("--remove-job", action="store_true",
+                        help="Remove background job(s) matching --repo/--chat filters")
     parser.add_argument("--merge", nargs=2, metavar=("SOURCE", "TARGET"),
                         help="Merge SOURCE conversation into TARGET (prefix match on session ID)")
     args = parser.parse_args()
@@ -2506,6 +2665,58 @@ def main():
     if args.delete and not args.repo and not args.chat_id:
         print("ERROR: --delete requires --repo and/or --chat")
         sys.exit(1)
+
+    if args.remove_job and not args.repo and not args.chat_id:
+        print("ERROR: --remove-job requires --repo and/or --chat")
+        sys.exit(1)
+
+    if args.remove_job:
+        jobs_file = STATE_DIR / ".sync_jobs.json"
+        pid_file = STATE_DIR / ".sync.pid"
+        if not jobs_file.exists():
+            print("No background jobs configured.")
+            sys.exit(0)
+        try:
+            jobs = json.loads(jobs_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            print("No background jobs configured.")
+            sys.exit(0)
+
+        repo_filter = args.repo.lower() if args.repo else None
+        chat_filter = args.chat_id.lower() if args.chat_id else None
+        removed = []
+        for key in list(jobs.keys()):
+            if key.startswith("_"):
+                continue
+            job = jobs[key]
+            job_repo = (job.get("repo") or "").lower()
+            job_chat = (job.get("chat_id") or "").lower()
+            match = True
+            if repo_filter and repo_filter not in job_repo:
+                match = False
+            if chat_filter and not job_chat.startswith(chat_filter):
+                match = False
+            if match:
+                removed.append(key)
+                del jobs[key]
+
+        if not removed:
+            print("No matching background jobs found.")
+            sys.exit(0)
+
+        jobs_file.write_text(json.dumps(jobs, indent=2))
+        for key in removed:
+            print(f"Removed [{key}]")
+
+        remaining = sum(1 for k in jobs if not k.startswith("_"))
+        if remaining == 0:
+            _kill_existing_daemon(pid_file, jobs_file)
+            jobs_file.unlink(missing_ok=True)
+            print("No jobs remaining — daemon stopped.")
+        else:
+            _kill_existing_daemon(pid_file, jobs_file)
+            print(f"{remaining} job(s) remaining — restart with: python sync_claude_history.py --background")
+        sys.exit(0)
 
     if not CLAUDE_PROJECTS_DIR.exists():
         CLAUDE_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
