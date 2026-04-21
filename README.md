@@ -36,7 +36,7 @@ Conversations are organized by **git remote URL**, so they follow the repo — n
 |---|---|
 | ⬆️ **Push** | Scans `~/.claude/projects/`, resolves each to its git remote, uploads to the matching Drive folder + subfolder by relative path |
 | ⬇️ **Pull** | Finds the local repo with the same git remote, downloads into the correct `~/.claude/projects/` dir |
-| 🔄 **Sync** | MD5 checksums skip identical files; when files differ, newer modification time wins |
+| 🔄 **Sync** | MD5 checksums skip identical files; when files differ, newer modification time wins; when both sides have unique entries (two machines syncing same chat), auto-merges by timestamp |
 | 🏷️ **Names** | Conversation titles (from `/rename`) are synced via `_titles.json` and injected on pull |
 | 🗑️ **Delete** | Remove conversations from Drive (`-d --repo <name>`) or locally (`-d --local --repo <name>`), optionally filtered by `--chat` |
 | 🔁 **Background** | Auto-sync with `--background`, writes PID to `.sync.pid` |

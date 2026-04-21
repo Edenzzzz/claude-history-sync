@@ -1086,6 +1086,110 @@ def repair_uuid_chain(jsonl_path: Path) -> int:
     return fixes
 
 
+def merge_jsonl_by_timestamp(local_path: Path, remote_text: str) -> bool:
+    """Merge local and remote JSONL when both sides have unique entries.
+
+    When two machines background-sync the same conversation, each may append
+    entries the other doesn't have.  Instead of one side winning (and losing
+    the other's work), this merges both sets of entries:
+
+    1. Union all entries by uuid (common entries kept once, unique from each side)
+    2. Sort uuid'd entries by timestamp
+    3. Rebuild the parentUuid chain in timestamp order
+    4. Append non-uuid metadata entries from both sides (deduplicated)
+
+    Returns True if a merge was performed, False if no conflict (one side is a
+    strict superset of the other — normal push/pull handles that).
+    """
+    try:
+        with open(local_path, "r") as f:
+            local_lines = f.readlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+
+    remote_lines = remote_text.splitlines(keepends=True)
+    if not remote_lines:
+        return False
+
+    def parse_entries(lines):
+        uuid_entries = {}  # uuid -> (parsed_dict, raw_line)
+        meta_lines = []    # lines without uuid
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            uid = d.get("uuid")
+            if uid:
+                uuid_entries[uid] = (d, line if line.endswith("\n") else line + "\n")
+            else:
+                meta_lines.append((d, line if line.endswith("\n") else line + "\n"))
+        return uuid_entries, meta_lines
+
+    local_uuids, local_meta = parse_entries(local_lines)
+    remote_uuids, remote_meta = parse_entries(remote_lines)
+
+    local_only = local_uuids.keys() - remote_uuids.keys()
+    remote_only = remote_uuids.keys() - local_uuids.keys()
+
+    if not local_only or not remote_only:
+        return False
+
+    # Both sides have unique entries — merge
+    merged = {}
+    for uid in local_uuids.keys() | remote_uuids.keys():
+        if uid in local_uuids:
+            merged[uid] = local_uuids[uid]
+        else:
+            merged[uid] = remote_uuids[uid]
+
+    # Sort by timestamp
+    def sort_key(item):
+        uid, (d, _) = item
+        ts = d.get("timestamp", "")
+        return ts if ts else ""
+
+    sorted_entries = sorted(merged.items(), key=sort_key)
+
+    # Rebuild parentUuid chain in timestamp order — every entry after the
+    # first gets its parentUuid rewritten to point to the previous entry so
+    # the merged conversation forms a single linear chain that CC can walk.
+    prev_uuid = None
+    rewritten = []
+    for uid, (d, raw_line) in sorted_entries:
+        if prev_uuid is not None:
+            d = dict(d)
+            d["parentUuid"] = prev_uuid
+            raw_line = json.dumps(d, ensure_ascii=False) + "\n"
+        prev_uuid = uid
+        rewritten.append(raw_line)
+
+    # Deduplicate metadata by serialized content
+    seen_meta = set()
+    merged_meta = []
+    for d, raw_line in local_meta + remote_meta:
+        key = raw_line.strip()
+        if key not in seen_meta:
+            seen_meta.add(key)
+            merged_meta.append(raw_line)
+
+    before_stat = local_path.stat()
+    tmp = local_path.with_suffix(local_path.suffix + ".merge.tmp")
+    with open(tmp, "w") as f:
+        for line in rewritten:
+            f.write(line)
+        for line in merged_meta:
+            f.write(line)
+    tmp.replace(local_path)
+    try:
+        os.utime(local_path, (before_stat.st_atime, before_stat.st_mtime))
+    except OSError:
+        pass
+    return True
+
+
 def _first_cwd_in_file(jsonl_path: Path) -> str | None:
     """Return the first ``cwd`` value found in the file, or ``None``."""
     try:
@@ -1437,6 +1541,33 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
             ).timestamp()
 
             remote_size = int(remote.get("size", 0))
+
+            # Try merge when both sides have unique entries (two machines
+            # background-syncing the same conversation).  Only attempt when
+            # both files are within 2x of each other — if one is drastically
+            # smaller, the normal push/pull/shrunk-guard logic is more
+            # appropriate than a merge.
+            size_ratio_ok = (remote_size > 0 and local_size > 0
+                             and local_size <= remote_size * 2
+                             and remote_size <= local_size * 2)
+            if (not args.dry_run and not args.pull_only and not args.push_only
+                    and size_ratio_ok):
+                try:
+                    remote_text = download_string(service, remote["id"])
+                    merged = merge_jsonl_by_timestamp(local_path, remote_text)
+                except Exception:
+                    merged = False
+                if merged:
+                    repair_uuid_chain(local_path)
+                    if local_cwd:
+                        rewrite_cwd_if_needed(local_path, local_cwd)
+                    merged_size = local_path.stat().st_size
+                    media = MediaFileUpload(str(local_path))
+                    service.files().update(fileId=remote["id"], media_body=media).execute()
+                    print(f"{indent}[MERGED] {fname} "
+                          f"(local {format_size(local_size)} + remote {format_size(remote_size)} → {format_size(merged_size)})")
+                    pushed += 1
+                    continue
 
             if local_mtime > remote_mtime and not args.pull_only:
                 # Guard: if local is newer but much smaller (<=95% of remote),

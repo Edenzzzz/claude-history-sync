@@ -536,3 +536,147 @@ class TestTrimCompact:
         assert trimmed is False
         assert before == after == before_size
         assert not p.with_suffix(".jsonl.pretrim.bak").exists()
+
+
+# ---------------------------------------------------------------------------
+# Merge — conflict resolution for multi-machine background sync
+# ---------------------------------------------------------------------------
+
+class TestMerge:
+    def test_merge_both_sides_unique(self, tmp_path):
+        """Merges unique entries from both local and remote, ordered by timestamp."""
+        from sync_claude_history import merge_jsonl_by_timestamp
+
+        # Common base: u1, a1
+        common = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "timestamp": "2026-04-21T01:00:00Z",
+             "message": {"role": "user", "content": "start"}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+             "timestamp": "2026-04-21T01:01:00Z",
+             "message": {"role": "assistant", "content": "ok"}},
+        ]
+        # Local added u2 at T=03
+        local_entries = common + [
+            {"type": "user", "uuid": "u2", "parentUuid": "a1",
+             "timestamp": "2026-04-21T01:03:00Z",
+             "message": {"role": "user", "content": "local msg"}},
+        ]
+        # Remote added u3 at T=02
+        remote_entries = common + [
+            {"type": "user", "uuid": "u3", "parentUuid": "a1",
+             "timestamp": "2026-04-21T01:02:00Z",
+             "message": {"role": "user", "content": "remote msg"}},
+        ]
+
+        p = tmp_path / "conv.jsonl"
+        with open(p, "w") as f:
+            for e in local_entries:
+                f.write(json.dumps(e) + "\n")
+
+        remote_text = "\n".join(json.dumps(e) for e in remote_entries) + "\n"
+        result = merge_jsonl_by_timestamp(p, remote_text)
+        assert result is True
+
+        with open(p) as f:
+            merged = [json.loads(l) for l in f if l.strip()]
+
+        uuids = [e["uuid"] for e in merged if e.get("uuid")]
+        # u3 (T=02) should come before u2 (T=03)
+        assert uuids == ["u1", "a1", "u3", "u2"]
+
+    def test_merge_no_conflict(self, tmp_path):
+        """Returns False when one side is a superset (no merge needed)."""
+        from sync_claude_history import merge_jsonl_by_timestamp
+
+        entries = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "timestamp": "2026-04-21T01:00:00Z"},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+             "timestamp": "2026-04-21T01:01:00Z"},
+        ]
+        # Local has both, remote has only u1 (local is superset)
+        p = tmp_path / "conv.jsonl"
+        with open(p, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        remote_text = json.dumps(entries[0]) + "\n"
+        assert merge_jsonl_by_timestamp(p, remote_text) is False
+
+    def test_merge_preserves_metadata(self, tmp_path):
+        """Metadata entries (no uuid) from both sides are kept."""
+        from sync_claude_history import merge_jsonl_by_timestamp
+
+        common = [{"type": "user", "uuid": "u1", "parentUuid": None,
+                    "timestamp": "2026-04-21T01:00:00Z"}]
+        local_entries = common + [
+            {"type": "user", "uuid": "u2", "parentUuid": "u1",
+             "timestamp": "2026-04-21T01:02:00Z"},
+            {"type": "custom-title"},
+        ]
+        remote_entries = common + [
+            {"type": "user", "uuid": "u3", "parentUuid": "u1",
+             "timestamp": "2026-04-21T01:01:00Z"},
+            {"type": "file-history-snapshot"},
+        ]
+
+        p = tmp_path / "conv.jsonl"
+        with open(p, "w") as f:
+            for e in local_entries:
+                f.write(json.dumps(e) + "\n")
+
+        remote_text = "\n".join(json.dumps(e) for e in remote_entries) + "\n"
+        assert merge_jsonl_by_timestamp(p, remote_text) is True
+
+        with open(p) as f:
+            merged = [json.loads(l) for l in f if l.strip()]
+
+        types = [e.get("type") for e in merged]
+        assert "custom-title" in types
+        assert "file-history-snapshot" in types
+
+    def test_merge_chain_intact(self, tmp_path):
+        """After merge, parentUuid chain is walkable from tail to root."""
+        from sync_claude_history import merge_jsonl_by_timestamp
+
+        common = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "timestamp": "2026-04-21T01:00:00Z"},
+        ]
+        local_entries = common + [
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+             "timestamp": "2026-04-21T01:03:00Z"},
+            {"type": "user", "uuid": "u2", "parentUuid": "a1",
+             "timestamp": "2026-04-21T01:05:00Z"},
+        ]
+        remote_entries = common + [
+            {"type": "user", "uuid": "r1", "parentUuid": "u1",
+             "timestamp": "2026-04-21T01:02:00Z"},
+            {"type": "assistant", "uuid": "r2", "parentUuid": "r1",
+             "timestamp": "2026-04-21T01:04:00Z"},
+        ]
+
+        p = tmp_path / "conv.jsonl"
+        with open(p, "w") as f:
+            for e in local_entries:
+                f.write(json.dumps(e) + "\n")
+
+        remote_text = "\n".join(json.dumps(e) for e in remote_entries) + "\n"
+        assert merge_jsonl_by_timestamp(p, remote_text) is True
+
+        with open(p) as f:
+            merged = [json.loads(l) for l in f if l.strip()]
+
+        uuid_entries = {e["uuid"]: e for e in merged if e.get("uuid")}
+        # Walk from last entry to root
+        uuids_ordered = [e["uuid"] for e in merged if e.get("uuid")]
+        current = uuids_ordered[-1]
+        chain = [current]
+        while uuid_entries[current].get("parentUuid"):
+            parent = uuid_entries[current]["parentUuid"]
+            assert parent in uuid_entries, f"Dangling parent {parent}"
+            current = parent
+            chain.append(current)
+        chain.reverse()
+        assert chain == uuids_ordered
