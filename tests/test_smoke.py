@@ -5,6 +5,7 @@ Tests that don't need Drive (errors, local delete, background) skip the fixture.
 """
 
 import io
+import hashlib
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -44,6 +46,7 @@ def _parse_args(args_list):
     parser.add_argument("--background", type=int, nargs="?", const=600, default=None)
     parser.add_argument("--remove-job", action="store_true")
     parser.add_argument("--merge", nargs=2, default=None)
+    parser.add_argument("--board", nargs="?", const="sync_board.html", default=None)
     return parser.parse_args(args_list)
 
 
@@ -90,6 +93,27 @@ class TestDryRun:
     def test_pull(self, drive):
         out = run_sync(["--pull", "--dry-run"], *drive)
         check_format(out)
+
+    def test_dry_run_does_not_delete_empty_local_conversations(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        fs_dir = tmp_path / "repo"
+        fs_dir.mkdir()
+        projects_dir = tmp_path / "projects"
+        projects_dir.mkdir()
+        encoded = str(fs_dir).replace("/", "-").replace("_", "-").replace(".", "-")
+        project_dir = projects_dir / encoded
+        project_dir.mkdir()
+        empty_chat = project_dir / "empty.jsonl"
+        empty_chat.write_text(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+
+        monkeypatch.setattr(sync, "CLAUDE_PROJECTS_DIR", projects_dir)
+        monkeypatch.setattr(sync, "CODEX_HOME", tmp_path / ".codex")
+        out = run_sync(["--push", "--dry-run"], service=None, root_folder_id=None)
+
+        check_format(out)
+        assert "Would clean 1 empty conversation(s)" in out
+        assert empty_chat.exists()
 
 
 class TestFilters:
@@ -385,6 +409,406 @@ class TestTrimCompact:
 
         # Second call is a no-op (returns 0)
         assert rewrite_cwd_if_needed(p, "/local/repo") == 0
+
+
+class TestCodexSupport:
+    class _FakeRequest:
+        def __init__(self, fn):
+            self._fn = fn
+
+        def execute(self):
+            return self._fn()
+
+    class _FakeMedia:
+        def __init__(self, filename, *args, **kwargs):
+            self.filename = filename
+
+    class _FakeFiles:
+        def __init__(self, drive):
+            self.drive = drive
+
+        def create(self, body=None, media_body=None, fields=None):
+            return TestCodexSupport._FakeRequest(
+                lambda: self.drive.create(body or {}, media_body)
+            )
+
+        def update(self, fileId, body=None, media_body=None):
+            return TestCodexSupport._FakeRequest(
+                lambda: self.drive.update(fileId, body or {}, media_body)
+            )
+
+    class _FakeDrive:
+        def __init__(self):
+            self.root_id = "root"
+            self._next_id = 1
+            self.folders = {
+                self.root_id: {
+                    "id": self.root_id,
+                    "name": "root",
+                    "parent": None,
+                    "description": "",
+                    "folders": {},
+                    "files": {},
+                }
+            }
+            self.files_by_id = {}
+
+        def files(self):
+            return TestCodexSupport._FakeFiles(self)
+
+        def _id(self, prefix):
+            value = f"{prefix}{self._next_id}"
+            self._next_id += 1
+            return value
+
+        def get_or_create_folder(self, service, folder_name, parent_id=None):
+            parent_id = parent_id or self.root_id
+            existing = self.folders[parent_id]["folders"].get(folder_name)
+            if existing:
+                return existing
+            folder_id = self._id("folder")
+            self.folders[parent_id]["folders"][folder_name] = folder_id
+            self.folders[folder_id] = {
+                "id": folder_id,
+                "name": folder_name,
+                "parent": parent_id,
+                "description": "",
+                "folders": {},
+                "files": {},
+            }
+            return folder_id
+
+        def list_drive_folders(self, service, parent_id, include_description=False):
+            out = {}
+            for name, folder_id in self.folders[parent_id]["folders"].items():
+                if include_description:
+                    out[name] = {
+                        "id": folder_id,
+                        "description": self.folders[folder_id].get("description", ""),
+                    }
+                else:
+                    out[name] = folder_id
+            return out
+
+        def list_remote_files(self, service, folder_id):
+            return {
+                name: {
+                    "id": f["id"],
+                    "name": name,
+                    "modifiedTime": f["modifiedTime"],
+                    "md5Checksum": f["md5Checksum"],
+                    "size": str(f["size"]),
+                }
+                for name, f in self.folders[folder_id]["files"].items()
+            }
+
+        def put_file(self, folder_id, name, content, existing_id=None, modified_time=None):
+            if isinstance(content, str):
+                content = content.encode()
+            file_id = existing_id or self.folders[folder_id]["files"].get(name, {}).get("id") or self._id("file")
+            if modified_time is None:
+                modified_time = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            record = {
+                "id": file_id,
+                "name": name,
+                "parent": folder_id,
+                "content": content,
+                "modifiedTime": modified_time,
+                "md5Checksum": hashlib.md5(content).hexdigest(),
+                "size": len(content),
+            }
+            self.folders[folder_id]["files"][name] = record
+            self.files_by_id[file_id] = record
+            return {"id": file_id}
+
+        def create(self, body, media_body):
+            if body.get("mimeType") == "application/vnd.google-apps.folder":
+                return {"id": self.get_or_create_folder(None, body["name"], body.get("parents", [self.root_id])[0])}
+            parent_id = body["parents"][0]
+            with open(media_body.filename, "rb") as f:
+                content = f.read()
+            return self.put_file(parent_id, body["name"], content)
+
+        def update(self, file_id, body, media_body):
+            if file_id in self.folders:
+                self.folders[file_id].update(body)
+                return {"id": file_id}
+            record = self.files_by_id[file_id]
+            if media_body is not None:
+                with open(media_body.filename, "rb") as f:
+                    return self.put_file(record["parent"], record["name"], f.read(), existing_id=file_id)
+            record.update(body)
+            return {"id": file_id}
+
+        def download(self, file_id, local_path):
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(self.files_by_id[file_id]["content"])
+
+    def _git_repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "git@github.com:org/repo.git"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        return repo
+
+    def _patch_fake_drive(self, monkeypatch, sync):
+        drive = self._FakeDrive()
+        monkeypatch.setattr(sync, "MediaFileUpload", self._FakeMedia)
+        monkeypatch.setattr(sync, "get_or_create_folder", drive.get_or_create_folder)
+        monkeypatch.setattr(sync, "list_drive_folders", drive.list_drive_folders)
+        monkeypatch.setattr(sync, "list_remote_files", drive.list_remote_files)
+        monkeypatch.setattr(
+            sync,
+            "batch_list_drive_folders",
+            lambda service, folder_ids: {
+                key: drive.list_drive_folders(service, folder_id)
+                for key, folder_id in folder_ids.items()
+            },
+        )
+        monkeypatch.setattr(
+            sync,
+            "batch_list_remote_files",
+            lambda service, folder_ids: {
+                key: drive.list_remote_files(service, folder_id)
+                for key, folder_id in folder_ids.items()
+            },
+        )
+        monkeypatch.setattr(
+            sync,
+            "upload_string",
+            lambda service, content, name, folder_id, existing_id=None: drive.put_file(
+                folder_id, name, content, existing_id=existing_id
+            ),
+        )
+        monkeypatch.setattr(
+            sync,
+            "download_file",
+            lambda service, file_id, local_path: drive.download(file_id, local_path),
+        )
+        monkeypatch.setattr(
+            sync,
+            "download_string",
+            lambda service, file_id: drive.files_by_id[file_id]["content"].decode(),
+        )
+        return drive
+
+    def _codex_rollout(self, codex_home, repo, session_id="019e-test"):
+        sessions = codex_home / "sessions" / "2026" / "06" / "05"
+        sessions.mkdir(parents=True)
+        subdir = repo / "src"
+        subdir.mkdir()
+        p = sessions / f"rollout-2026-06-05T01-02-03-{session_id}.jsonl"
+        rows = [
+            {
+                "timestamp": "2026-06-05T01:02:03Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "cwd": str(subdir),
+                    "git": {"repository_url": "git@github.com:org/repo.git"},
+                },
+            },
+            {
+                "timestamp": "2026-06-05T01:02:04Z",
+                "type": "turn_context",
+                "payload": {"cwd": str(subdir)},
+            },
+            {
+                "timestamp": "2026-06-05T01:02:05Z",
+                "type": "response_item",
+                "payload": {
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "first prompt"}],
+                    }
+                },
+            },
+        ]
+        with open(p, "w") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        return p
+
+    def test_codex_index_and_cwd_rewrite(self, tmp_path):
+        from sync_claude_history import (
+            build_codex_index,
+            normalize_git_url,
+            parse_codex_rollout,
+            rewrite_codex_cwd_if_needed,
+        )
+
+        repo = self._git_repo(tmp_path)
+        codex_home = tmp_path / ".codex"
+        rollout = self._codex_rollout(codex_home, repo)
+
+        meta = parse_codex_rollout(rollout)
+        assert meta["session_id"] == "019e-test"
+        assert meta["first_user_message"] == "first prompt"
+
+        index = build_codex_index(codex_home)
+        key = normalize_git_url("git@github.com:org/repo.git")
+        assert key in index
+        assert index[key][0]["rel_path"] == "src"
+
+        assert rewrite_codex_cwd_if_needed(rollout, "/new/repo/src") == 2
+        after = [json.loads(line) for line in rollout.read_text().splitlines()]
+        assert after[0]["payload"]["cwd"] == "/new/repo/src"
+        assert after[1]["payload"]["cwd"] == "/new/repo/src"
+
+    def test_codex_subfolder_roundtrip_and_session_index(self, tmp_path):
+        from sync_claude_history import (
+            codex_drive_subfolder_to_rel_path,
+            codex_rel_path_to_drive_subfolder,
+            upsert_codex_session_index,
+        )
+
+        sf = codex_rel_path_to_drive_subfolder("src/tools")
+        assert sf == "_codex__src__tools"
+        assert codex_drive_subfolder_to_rel_path(sf) == "src/tools"
+        assert codex_drive_subfolder_to_rel_path("_codex__root") == "."
+
+        codex_home = tmp_path / ".codex"
+        upsert_codex_session_index(
+            [{"session_id": "sid-1", "title": "pulled chat", "updated_at": 1780500000}],
+            codex_home,
+        )
+        rows = [json.loads(line) for line in (codex_home / "session_index.jsonl").read_text().splitlines()]
+        assert rows == [{
+            "id": "sid-1",
+            "thread_name": "pulled chat",
+            "updated_at": "2026-06-03T15:20:00Z",
+        }]
+
+    def test_board_shows_claude_and_codex_prefixes(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        repo = self._git_repo(tmp_path)
+        codex_home = tmp_path / ".codex"
+        self._codex_rollout(codex_home, repo, session_id="019e-board")
+        monkeypatch.setattr(sync, "CODEX_HOME", codex_home)
+
+        claude_project = tmp_path / "claude-project"
+        claude_project.mkdir()
+        claude_file = claude_project / "claude-session.jsonl"
+        claude_rows = [
+            {"type": "user", "uuid": "u1", "message": {"role": "user", "content": "hi"}},
+            {"type": "assistant", "uuid": "a1", "message": {"role": "assistant", "content": "ok"}},
+            {"type": "custom-title", "customTitle": "claude title"},
+        ]
+        with open(claude_file, "w") as f:
+            for row in claude_rows:
+                f.write(json.dumps(row) + "\n")
+
+        key = sync.normalize_git_url("git@github.com:org/repo.git")
+        monkeypatch.setattr(
+            sync,
+            "build_local_index",
+            lambda: {key: [(claude_project, "git@github.com:org/repo.git", str(repo), ".")]},
+        )
+
+        board = sync.generate_board(tmp_path / "board.html")
+        text = board.read_text()
+        assert "[claude]" in text
+        assert "[codex]" in text
+        assert "claude title" in text
+        assert "first prompt" in text
+
+    def test_codex_run_sync_pushes_rollout_to_drive_subfolder(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        repo = self._git_repo(tmp_path)
+        codex_home = tmp_path / ".codex"
+        rollout = self._codex_rollout(codex_home, repo, session_id="019e-push")
+        monkeypatch.setattr(sync, "CODEX_HOME", codex_home)
+        monkeypatch.setattr(sync, "CLAUDE_PROJECTS_DIR", tmp_path / "empty-claude")
+        drive = self._patch_fake_drive(monkeypatch, sync)
+
+        out = run_sync(["--push"], drive, drive.root_id)
+        check_format(out)
+        assert "[codex] git@github.com:org/repo.git" in out
+        assert "[codex PUSHED NEW]" in out
+
+        url_key = sync.normalize_git_url("git@github.com:org/repo.git")
+        repo_folder_id = drive.folders[drive.root_id]["folders"][url_key]
+        assert drive.folders[repo_folder_id]["description"] == "git@github.com:org/repo.git"
+        metadata = json.loads(drive.folders[repo_folder_id]["files"]["_metadata.json"]["content"])
+        assert metadata["sources"] == ["claude", "codex"]
+
+        codex_folder_id = drive.folders[repo_folder_id]["folders"]["_codex__src"]
+        remote_files = drive.folders[codex_folder_id]["files"]
+        assert rollout.name in remote_files
+        assert json.loads(remote_files[rollout.name]["content"].splitlines()[0])["payload"]["id"] == "019e-push"
+
+    def test_codex_run_sync_pulls_remote_rollout_and_indexes_it(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        codex_home = tmp_path / ".codex"
+        monkeypatch.setattr(sync, "CODEX_HOME", codex_home)
+        monkeypatch.setattr(sync, "CLAUDE_PROJECTS_DIR", tmp_path / "empty-claude")
+        drive = self._patch_fake_drive(monkeypatch, sync)
+
+        raw_url = "git@github.com:org/repo.git"
+        url_key = sync.normalize_git_url(raw_url)
+        repo_folder_id = drive.get_or_create_folder(None, url_key, drive.root_id)
+        drive.folders[repo_folder_id]["description"] = raw_url
+        codex_folder_id = drive.get_or_create_folder(None, "_codex__src", repo_folder_id)
+        fname = "rollout-2026-06-05T02-03-04-019e-pull.jsonl"
+        old_cwd = "/old/machine/repo/src"
+        rows = [
+            {
+                "timestamp": "2026-06-05T02:03:04Z",
+                "type": "session_meta",
+                "payload": {"id": "019e-pull", "cwd": old_cwd, "git": {"repository_url": raw_url}},
+            },
+            {
+                "timestamp": "2026-06-05T02:03:05Z",
+                "type": "turn_context",
+                "payload": {"cwd": old_cwd},
+            },
+            {
+                "timestamp": "2026-06-05T02:03:06Z",
+                "type": "response_item",
+                "payload": {
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "remote prompt"}],
+                    }
+                },
+            },
+        ]
+        drive.put_file(
+            codex_folder_id,
+            fname,
+            "".join(json.dumps(row) + "\n" for row in rows),
+            modified_time="2026-06-05T02:03:06Z",
+        )
+        monkeypatch.setattr(sync, "scan_local_git_repos", lambda: {url_key: (str(repo), raw_url)})
+
+        out = run_sync(["--pull"], drive, drive.root_id)
+        check_format(out)
+        assert "[codex PULLED NEW]" in out
+
+        local_path = codex_home / "sessions" / "2026" / "06" / "05" / fname
+        pulled = [json.loads(line) for line in local_path.read_text().splitlines()]
+        assert pulled[0]["payload"]["cwd"] == str(repo / "src")
+        assert pulled[1]["payload"]["cwd"] == str(repo / "src")
+
+        index_rows = [
+            json.loads(line)
+            for line in (codex_home / "session_index.jsonl").read_text().splitlines()
+        ]
+        assert index_rows == [{
+            "id": "019e-pull",
+            "thread_name": "remote prompt",
+            "updated_at": "2026-06-05T02:03:06Z",
+        }]
 
     def test_repair_uuid_chain(self, tmp_path):
         """repair_uuid_chain bridges broken parentUuid links."""

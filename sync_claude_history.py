@@ -30,16 +30,18 @@ Usage:
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
+import sqlite3
 import socket
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -136,12 +138,14 @@ def patch_dns_if_needed():
         pass
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
 DRIVE_FOLDER_NAME = "claude-code-history"
 SCRIPT_DIR = Path(__file__).parent
 STATE_DIR = Path(os.environ.get("SYNC_STATE_DIR", str(SCRIPT_DIR)))
 TOKEN_PATH = SCRIPT_DIR / "token.json"
 CREDENTIALS_PATH = SCRIPT_DIR / "credentials.json"
 SERVICE_ACCOUNT_PATH = SCRIPT_DIR / "service-account.json"
+CODEX_DRIVE_PREFIX = "_codex__"
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +524,24 @@ def drive_subfolder_to_rel_path(subfolder: str) -> str:
     return subfolder.replace("__", "/")
 
 
+def codex_rel_path_to_drive_subfolder(rel_path: str) -> str:
+    """Drive subfolder for Codex rollouts at a repo-relative cwd."""
+    if rel_path == ".":
+        return f"{CODEX_DRIVE_PREFIX}root"
+    return CODEX_DRIVE_PREFIX + rel_path.replace("/", "__")
+
+
+def is_codex_drive_subfolder(subfolder: str) -> bool:
+    return subfolder.startswith(CODEX_DRIVE_PREFIX)
+
+
+def codex_drive_subfolder_to_rel_path(subfolder: str) -> str:
+    suffix = subfolder[len(CODEX_DRIVE_PREFIX):]
+    if suffix == "root":
+        return "."
+    return suffix.replace("__", "/")
+
+
 def is_gitignored(git_root: str, rel_path: str) -> bool:
     """Check if a relative path (or any parent) is gitignored in the repo."""
     if not git_root or rel_path == ".":
@@ -538,6 +560,319 @@ def is_gitignored(git_root: str, rel_path: str) -> bool:
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
     return False
+
+
+def _parse_time_value(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        # Codex sqlite stores seconds in state_5 today, but handle ms too.
+        return float(value / 1000 if value > 10_000_000_000 else value)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _iter_jsonl_objects(jsonl_path: Path):
+    try:
+        with open(jsonl_path, "r") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+    except (OSError, UnicodeDecodeError):
+        return
+
+
+def parse_codex_rollout(jsonl_path: Path) -> dict:
+    """Read stable metadata from a Codex rollout JSONL file."""
+    meta = {
+        "session_id": None,
+        "cwd": None,
+        "git_url": None,
+        "created_at": None,
+        "updated_at": None,
+        "first_user_message": None,
+    }
+    for entry in _iter_jsonl_objects(jsonl_path):
+        ts = _parse_time_value(entry.get("timestamp"))
+        if ts is not None:
+            meta["updated_at"] = max(meta["updated_at"] or ts, ts)
+            if meta["created_at"] is None:
+                meta["created_at"] = ts
+
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+        typ = entry.get("type")
+        if typ == "session_meta":
+            meta["session_id"] = meta["session_id"] or payload.get("id")
+            meta["cwd"] = meta["cwd"] or payload.get("cwd")
+            meta["created_at"] = meta["created_at"] or _parse_time_value(payload.get("timestamp"))
+            git_info = payload.get("git")
+            if isinstance(git_info, dict):
+                meta["git_url"] = meta["git_url"] or git_info.get("repository_url")
+        elif typ == "turn_context":
+            meta["cwd"] = meta["cwd"] or payload.get("cwd")
+        elif meta["first_user_message"] is None:
+            item = payload.get("item") if isinstance(payload, dict) else None
+            if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "user":
+                content = item.get("content")
+                if isinstance(content, list):
+                    parts = []
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            parts.append(part["text"])
+                    if parts:
+                        meta["first_user_message"] = " ".join(parts).strip()
+                elif isinstance(content, str):
+                    meta["first_user_message"] = content.strip()
+
+    if meta["updated_at"] is None:
+        try:
+            meta["updated_at"] = jsonl_path.stat().st_mtime
+        except OSError:
+            pass
+    return meta
+
+
+def _load_codex_session_index(codex_home: Path | None = None) -> dict:
+    codex_home = Path(codex_home or CODEX_HOME).expanduser()
+    index_path = codex_home / "session_index.jsonl"
+    by_id = {}
+    if not index_path.exists():
+        return by_id
+    for entry in _iter_jsonl_objects(index_path):
+        sid = entry.get("id")
+        if sid:
+            by_id[sid] = entry
+    return by_id
+
+
+def _load_codex_sqlite_threads(codex_home: Path | None = None) -> dict:
+    codex_home = Path(codex_home or CODEX_HOME).expanduser()
+    db_path = codex_home / "state_5.sqlite"
+    if not db_path.exists():
+        return {}
+    rows = {}
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        available = {
+            row["name"]
+            for row in con.execute("pragma table_info(threads)")
+        }
+        required = {"id", "rollout_path"}
+        if not required.issubset(available):
+            return {}
+        wanted = [
+            "id",
+            "rollout_path",
+            "cwd",
+            "title",
+            "git_origin_url",
+            "updated_at",
+            "created_at",
+            "first_user_message",
+            "preview",
+        ]
+        columns = [c for c in wanted if c in available]
+        cur = con.execute(
+            f"select {', '.join(columns)} from threads where rollout_path is not null"
+        )
+        for row in cur:
+            rollout_path = Path(str(row["rollout_path"])).expanduser()
+            data = dict(row)
+            if not data.get("first_user_message") and data.get("preview"):
+                data["first_user_message"] = data["preview"]
+            rows[str(rollout_path)] = data
+    except sqlite3.Error:
+        return {}
+    finally:
+        if con is not None:
+            con.close()
+    return rows
+
+
+def _codex_rollout_path_for_remote_name(fname: str, codex_home: Path | None = None) -> Path:
+    codex_home = Path(codex_home or CODEX_HOME).expanduser()
+    m = re.match(r"rollout-(\d{4})-(\d{2})-(\d{2})T", fname)
+    if m:
+        yyyy, mm, dd = m.groups()
+        return codex_home / "sessions" / yyyy / mm / dd / fname
+    return codex_home / "sessions" / "synced" / fname
+
+
+def _codex_local_cwd(git_root: str | None, rel_path: str | None) -> str | None:
+    if not git_root:
+        return None
+    if not rel_path or rel_path == ".":
+        return git_root
+    return os.path.join(git_root, rel_path)
+
+
+def _first_codex_cwd_in_file(jsonl_path: Path) -> str | None:
+    for entry in _iter_jsonl_objects(jsonl_path):
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+        if entry.get("type") in ("session_meta", "turn_context") and "cwd" in payload:
+            return payload["cwd"]
+    return None
+
+
+def rewrite_codex_cwd_if_needed(jsonl_path: Path, local_cwd: str) -> int:
+    """Rewrite Codex rollout cwd fields to the local repo path, preserving mtime."""
+    if not local_cwd:
+        return 0
+    first = _first_codex_cwd_in_file(jsonl_path)
+    if first is None or first == local_cwd:
+        return 0
+    try:
+        lines = jsonl_path.read_text().splitlines(keepends=True)
+        before_stat = jsonl_path.stat()
+    except (OSError, UnicodeDecodeError):
+        return 0
+
+    rewrote = 0
+    out = []
+    for line in lines:
+        if not line.strip():
+            out.append(line)
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            out.append(line)
+            continue
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else None
+        if entry.get("type") in ("session_meta", "turn_context") and payload and payload.get("cwd") != local_cwd:
+            payload["cwd"] = local_cwd
+            rewrote += 1
+            out.append(json.dumps(entry, ensure_ascii=False) + "\n")
+        else:
+            out.append(line)
+
+    if rewrote:
+        try:
+            jsonl_path.write_text("".join(out))
+            os.utime(jsonl_path, (before_stat.st_atime, before_stat.st_mtime))
+        except OSError:
+            return 0
+    return rewrote
+
+
+def build_codex_index(codex_home: Path | None = None) -> dict:
+    """Scan Codex rollout files and group them by normalized git remote URL."""
+    codex_home = Path(codex_home or CODEX_HOME).expanduser()
+    sqlite_rows = _load_codex_sqlite_threads(codex_home)
+    session_titles = _load_codex_session_index(codex_home)
+
+    rollout_paths = set()
+    sessions_dir = codex_home / "sessions"
+    if sessions_dir.exists():
+        rollout_paths.update(sessions_dir.glob("**/rollout-*.jsonl"))
+    for p in sqlite_rows:
+        pp = Path(p).expanduser()
+        if pp.exists():
+            rollout_paths.add(pp)
+
+    local_repos = None
+    index = {}
+    for rollout_path in sorted(rollout_paths):
+        parsed = parse_codex_rollout(rollout_path)
+        row = sqlite_rows.get(str(rollout_path), {})
+        session_id = parsed.get("session_id") or row.get("id") or rollout_path.stem
+        cwd = row.get("cwd") or parsed.get("cwd")
+        git_url = row.get("git_origin_url") or parsed.get("git_url")
+        git_root = find_git_root(cwd) if cwd and Path(cwd).exists() else None
+        if git_root:
+            git_url = get_git_remote(git_root) or git_url
+            rel_path = os.path.relpath(cwd, git_root)
+        else:
+            rel_path = "."
+            if git_url:
+                local_repos = local_repos if local_repos is not None else scan_local_git_repos()
+                match = local_repos.get(normalize_git_url(git_url))
+                if match:
+                    git_root, git_url = match
+        if git_root and rel_path and is_gitignored(git_root, rel_path):
+            continue
+
+        title_info = session_titles.get(session_id, {})
+        title = (
+            row.get("title")
+            or title_info.get("thread_name")
+            or parsed.get("first_user_message")
+            or row.get("first_user_message")
+        )
+        entry = {
+            "path": rollout_path,
+            "session_id": session_id,
+            "title": title,
+            "cwd": cwd,
+            "git_url": git_url,
+            "git_root": git_root,
+            "rel_path": rel_path,
+            "updated_at": _parse_time_value(row.get("updated_at")) or parsed.get("updated_at"),
+        }
+        key = normalize_git_url(git_url) if git_url else None
+        index.setdefault(key, []).append(entry)
+    return index
+
+
+def upsert_codex_session_index(entries: list[dict], codex_home: Path | None = None):
+    """Make pulled Codex rollouts discoverable by session_index.jsonl."""
+    if not entries:
+        return
+    codex_home = Path(codex_home or CODEX_HOME).expanduser()
+    index_path = codex_home / "session_index.jsonl"
+    existing = []
+    by_id = {}
+    if index_path.exists():
+        for entry in _iter_jsonl_objects(index_path):
+            sid = entry.get("id")
+            if sid:
+                by_id[sid] = entry
+            existing.append(entry)
+    for entry in entries:
+        sid = entry.get("session_id")
+        if not sid:
+            continue
+        updated = entry.get("updated_at")
+        updated_dt = (
+            datetime.fromtimestamp(updated, tz=timezone.utc)
+            if updated
+            else datetime.now(timezone.utc)
+        )
+        updated_iso = updated_dt.replace(tzinfo=None).isoformat() + "Z"
+        by_id[sid] = {
+            "id": sid,
+            "thread_name": entry.get("title") or entry.get("first_user_message") or sid,
+            "updated_at": updated_iso,
+        }
+    seen = set()
+    merged = []
+    for entry in existing:
+        sid = entry.get("id")
+        if sid in by_id and sid not in seen:
+            merged.append(by_id[sid])
+            seen.add(sid)
+        elif sid not in seen:
+            merged.append(entry)
+            if sid:
+                seen.add(sid)
+    for sid, entry in sorted(by_id.items()):
+        if sid not in seen:
+            merged.append(entry)
+
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = index_path.with_suffix(index_path.suffix + ".tmp")
+    tmp.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in merged))
+    tmp.replace(index_path)
 
 
 REPO_CACHE_PATH = SCRIPT_DIR / ".repo_cache.json"
@@ -1879,6 +2214,374 @@ def sync_memory(service, folder_id, local_dir: Path, args, indent="    ",
     return pushed, pulled
 
 
+def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=None,
+                     rel_path=".", indent="    ", remote_files=None):
+    """Sync Codex rollout JSONL files between local ~/.codex and Drive."""
+    if remote_files is None:
+        remote_files = list_remote_files(service, folder_id)
+
+    chat_ids = getattr(args, "chat_id", None)
+    chat_filters = [c.strip() for c in chat_ids.split(",")] if chat_ids else None
+    local_cwd = _codex_local_cwd(git_root, rel_path)
+
+    by_name = {}
+    for entry in entries:
+        fname = entry["path"].name
+        if chat_filters and not any(
+            entry.get("session_id", "").startswith(c) or fname.startswith(c)
+            for c in chat_filters
+        ):
+            continue
+        by_name[fname] = entry
+
+    if not args.dry_run and local_cwd:
+        for fname, entry in list(by_name.items()):
+            n = rewrite_codex_cwd_if_needed(entry["path"], local_cwd)
+            if n:
+                print(f"{indent}[codex CWD REWRITE] {fname} ({n} entries -> {local_cwd})")
+
+    pushed = pulled = skipped = 0
+    pulled_entries = []
+
+    for fname, entry in by_name.items():
+        local_path = entry["path"]
+        local_md5 = local_file_md5(local_path)
+        local_mtime = local_path.stat().st_mtime
+        local_size = local_path.stat().st_size
+
+        if fname in remote_files:
+            remote = remote_files[fname]
+            if local_md5 == remote.get("md5Checksum", ""):
+                skipped += 1
+                continue
+            remote_mtime = datetime.fromisoformat(
+                remote["modifiedTime"].replace("Z", "+00:00")
+            ).timestamp()
+            remote_size = int(remote.get("size", 0))
+            if local_mtime > remote_mtime and not args.pull_only:
+                action = "WOULD PUSH" if args.dry_run else "PUSHED"
+                if not args.dry_run:
+                    media = MediaFileUpload(str(local_path))
+                    service.files().update(fileId=remote["id"], media_body=media).execute()
+                print(f"{indent}[codex {action}] {fname} ({format_size(local_size)}, {format_time(local_mtime)})")
+                pushed += 1
+            elif remote_mtime > local_mtime and not args.push_only:
+                action = "WOULD PULL" if args.dry_run else "PULLED"
+                if not args.dry_run:
+                    download_file(service, remote["id"], local_path)
+                    if local_cwd:
+                        rewrite_codex_cwd_if_needed(local_path, local_cwd)
+                    pulled_meta = parse_codex_rollout(local_path)
+                    pulled_meta.update({
+                        "path": local_path,
+                        "title": entry.get("title"),
+                        "session_id": pulled_meta.get("session_id") or entry.get("session_id"),
+                    })
+                    pulled_entries.append(pulled_meta)
+                print(f"{indent}[codex {action}] {fname} ({format_size(remote_size)}, {format_time(remote_mtime)})")
+                pulled += 1
+            else:
+                skipped += 1
+        elif not args.pull_only:
+            action = "WOULD PUSH NEW" if args.dry_run else "PUSHED NEW"
+            if not args.dry_run:
+                media = MediaFileUpload(str(local_path))
+                service.files().create(
+                    body={"name": fname, "parents": [folder_id]},
+                    media_body=media,
+                ).execute()
+            print(f"{indent}[codex {action}] {fname} ({format_size(local_size)}, {format_time(local_mtime)})")
+            pushed += 1
+
+    if not args.push_only:
+        for fname, remote in remote_files.items():
+            if fname.startswith("_") or not fname.endswith(".jsonl"):
+                continue
+            if chat_filters and not any(fname.startswith(c) for c in chat_filters):
+                continue
+            if fname in by_name:
+                continue
+            local_path = _codex_rollout_path_for_remote_name(fname)
+            remote_size = int(remote.get("size", 0))
+            remote_mtime = datetime.fromisoformat(
+                remote["modifiedTime"].replace("Z", "+00:00")
+            ).timestamp()
+            action = "WOULD PULL NEW" if args.dry_run else "PULLED NEW"
+            if not args.dry_run:
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                download_file(service, remote["id"], local_path)
+                if local_cwd:
+                    rewrite_codex_cwd_if_needed(local_path, local_cwd)
+                pulled_meta = parse_codex_rollout(local_path)
+                pulled_meta.update({"path": local_path})
+                pulled_entries.append(pulled_meta)
+            print(f"{indent}[codex {action}] {fname} ({format_size(remote_size)}, {format_time(remote_mtime)})")
+            pulled += 1
+
+    if not args.dry_run:
+        upsert_codex_session_index(pulled_entries)
+
+    return pushed, pulled, skipped
+
+
+def sync_codex_push(service, root_folder_id, codex_git_projects: dict, args) -> bool:
+    """Push/sync local Codex conversations under repo Codex subfolders."""
+    printed_any = False
+    if args.pull_only:
+        return printed_any
+
+    for url_key, entries in sorted(codex_git_projects.items()):
+        raw_url = next((e.get("git_url") for e in entries if e.get("git_url")), url_key)
+        if not repo_matches_filter(raw_url, args.repo):
+            continue
+        repo_folder_id = get_or_create_folder(service, url_key, root_folder_id)
+        if not args.dry_run:
+            service.files().update(fileId=repo_folder_id, body={"description": raw_url}).execute()
+            repo_level_files = list_remote_files(service, repo_folder_id)
+            upload_string(
+                service,
+                json.dumps({
+                    "remote_url": raw_url,
+                    "normalized_key": url_key,
+                    "sources": ["claude", "codex"],
+                }, indent=2),
+                "_metadata.json",
+                repo_folder_id,
+                existing_id=repo_level_files.get("_metadata.json", {}).get("id"),
+            )
+
+        by_rel = {}
+        for entry in entries:
+            by_rel.setdefault(entry.get("rel_path") or ".", []).append(entry)
+        existing_subs = list_drive_folders(service, repo_folder_id)
+
+        B = "  ╠═══════════════════════════════════════════════════════════════════════════"
+        if not printed_any:
+            print(B)
+            printed_any = True
+        git_root = next((e.get("git_root") for e in entries if e.get("git_root")), None)
+        print(f"  ║ [codex] {raw_url}")
+        if git_root:
+            print(f"  ║   ╰─> {git_root}")
+        print(f"  ║ ----------------------------------------------------------------------")
+
+        for rel_path, rel_entries in sorted(by_rel.items()):
+            sf_name = codex_rel_path_to_drive_subfolder(rel_path)
+            subfolder_id = existing_subs.get(sf_name)
+            if not subfolder_id:
+                subfolder_id = get_or_create_folder(service, sf_name, repo_folder_id)
+            remote_sub_files = list_remote_files(service, subfolder_id)
+            local_count = len(rel_entries)
+            local_size = sum(e["path"].stat().st_size for e in rel_entries)
+            remote_count = sum(1 for k in remote_sub_files if k.endswith(".jsonl"))
+            remote_size = sum(
+                int(f.get("size", 0)) for k, f in remote_sub_files.items()
+                if k.endswith(".jsonl")
+            )
+            label = "." if rel_path == "." else rel_path
+            print(f"  ║ [codex] {label:<27s} {local_count:>2} local ({format_size(local_size):>8})  {remote_count:>2} remote ({format_size(remote_size):>8})")
+            if args.verbose:
+                for entry in sorted(rel_entries, key=lambda e: e["path"].name):
+                    title = entry.get("title") or "(untitled)"
+                    size = format_size(entry["path"].stat().st_size)
+                    mtime = format_time(entry["path"].stat().st_mtime)
+                    sid = entry.get("session_id") or entry["path"].stem
+                    print(f"  ║   ╰─ [codex] {sid[:8]}...  \"{title[:30]:<30s}\" {size:>8}  {mtime}")
+            pushed, pulled, skipped = sync_codex_files(
+                service, subfolder_id, rel_entries, args,
+                git_root=rel_entries[0].get("git_root"),
+                rel_path=rel_path,
+                indent="  ║   ",
+                remote_files=remote_sub_files,
+            )
+            if pushed or pulled:
+                if args.dry_run:
+                    print(f"  ║   => codex would push {pushed}, would pull {pulled}, {skipped} unchanged")
+                else:
+                    print(f"  ║   => codex {pushed} pushed, {pulled} pulled, {skipped} unchanged")
+        print(B)
+    return printed_any
+
+
+def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
+                    printed_any=False) -> bool:
+    """Pull remote Codex conversations for cloned repos, including new sessions."""
+    if args.push_only:
+        return printed_any
+    remote_repo_folders = list_drive_folders(service, root_folder_id, include_description=True)
+    local_repos = scan_local_git_repos()
+
+    local_by_url = {}
+    for url_key, entries in codex_git_projects.items():
+        for entry in entries:
+            rel_path = entry.get("rel_path") or "."
+            local_by_url.setdefault(url_key, {}).setdefault(rel_path, []).append(entry)
+
+    for url_key, folder_info in sorted(remote_repo_folders.items()):
+        repo_fid = folder_info["id"]
+        raw_url = folder_info.get("description") or url_key
+        if not repo_matches_filter(raw_url, args.repo):
+            continue
+        remote_subfolders = list_drive_folders(service, repo_fid)
+        codex_subfolders = {
+            name: fid for name, fid in remote_subfolders.items()
+            if is_codex_drive_subfolder(name)
+        }
+        if not codex_subfolders:
+            continue
+        repo_match = local_repos.get(url_key)
+        git_root = repo_match[0] if repo_match else None
+        raw_url = repo_match[1] if repo_match else raw_url
+        if not git_root and url_key in local_by_url:
+            git_root = next(
+                (e.get("git_root") for entries in local_by_url[url_key].values()
+                 for e in entries if e.get("git_root")),
+                None,
+            )
+        B = "  ╠═══════════════════════════════════════════════════════════════════════════"
+        if not printed_any:
+            print(B)
+            printed_any = True
+        if not git_root:
+            print(f"  ║ [codex] {raw_url}  (no local clone)")
+            print(f"  ║ ----------------------------------------------------------------------")
+            print(B)
+            continue
+        print(f"  ║ [codex] {raw_url}")
+        print(f"  ║   ╰─> {git_root}")
+        print(f"  ║ ----------------------------------------------------------------------")
+
+        for subfolder_name, subfolder_id in sorted(codex_subfolders.items()):
+            rel_path = codex_drive_subfolder_to_rel_path(subfolder_name)
+            if rel_path != "." and is_gitignored(git_root, rel_path):
+                continue
+            remote_sub_files = list_remote_files(service, subfolder_id)
+            remote_count = sum(1 for k in remote_sub_files if k.endswith(".jsonl"))
+            remote_size = sum(
+                int(f.get("size", 0)) for k, f in remote_sub_files.items()
+                if k.endswith(".jsonl")
+            )
+            entries = local_by_url.get(url_key, {}).get(rel_path, [])
+            local_count = len(entries)
+            local_size = sum(e["path"].stat().st_size for e in entries)
+            label = "." if rel_path == "." else rel_path
+            print(f"  ║ [codex] {label:<27s} {local_count:>2} local ({format_size(local_size):>8})  {remote_count:>2} remote ({format_size(remote_size):>8})")
+            pushed, pulled, skipped = sync_codex_files(
+                service, subfolder_id, entries, args,
+                git_root=git_root,
+                rel_path=rel_path,
+                indent="  ║   ",
+                remote_files=remote_sub_files,
+            )
+            if pushed or pulled:
+                if args.dry_run:
+                    print(f"  ║   => codex would push {pushed}, would pull {pulled}, {skipped} unchanged")
+                else:
+                    print(f"  ║   => codex {pushed} pushed, {pulled} pulled, {skipped} unchanged")
+        print(B)
+    return printed_any
+
+
+def build_board_rows() -> list[dict]:
+    """Collect local Claude and Codex conversations for the visualization board."""
+    rows = []
+    claude_index = build_local_index()
+    if None in claude_index:
+        resolve_unmatched_projects(claude_index)
+    for url_key, entries in claude_index.items():
+        if url_key is None:
+            continue
+        for project_dir, raw_url, git_root, rel_path in entries:
+            for p in sorted(project_dir.glob("*.jsonl")):
+                if is_empty_conversation(p):
+                    continue
+                rows.append({
+                    "source": "claude",
+                    "prefix": "[claude]",
+                    "repo": raw_url or url_key,
+                    "rel_path": rel_path or ".",
+                    "session_id": p.stem,
+                    "title": get_conversation_title(p) or "",
+                    "path": str(p),
+                    "size": p.stat().st_size,
+                    "mtime": p.stat().st_mtime,
+                })
+    codex_index = build_codex_index()
+    for url_key, entries in codex_index.items():
+        if url_key is None:
+            continue
+        for entry in entries:
+            p = entry["path"]
+            rows.append({
+                "source": "codex",
+                "prefix": "[codex]",
+                "repo": entry.get("git_url") or url_key,
+                "rel_path": entry.get("rel_path") or ".",
+                "session_id": entry.get("session_id") or p.stem,
+                "title": entry.get("title") or "",
+                "path": str(p),
+                "size": p.stat().st_size,
+                "mtime": entry.get("updated_at") or p.stat().st_mtime,
+            })
+    return sorted(rows, key=lambda r: r["mtime"], reverse=True)
+
+
+def generate_board(output_path: Path) -> Path:
+    rows = build_board_rows()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    generated = html.escape(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    body_rows = []
+    for row in rows:
+        title = row["title"] or "(untitled)"
+        body_rows.append(
+            "<tr>"
+            f"<td class=\"source {row['source']}\">{html.escape(row['prefix'])}</td>"
+            f"<td>{html.escape(title)}</td>"
+            f"<td>{html.escape(row['repo'])}</td>"
+            f"<td>{html.escape(row['rel_path'])}</td>"
+            f"<td><code>{html.escape(str(row['session_id'])[:12])}</code></td>"
+            f"<td>{html.escape(format_size(row['size']))}</td>"
+            f"<td>{html.escape(format_time(row['mtime']))}</td>"
+            f"<td><code>{html.escape(row['path'])}</code></td>"
+            "</tr>"
+        )
+    output_path.write_text(f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Claude/Codex Conversation Board</title>
+  <style>
+    body {{ font: 14px/1.4 system-ui, sans-serif; margin: 24px; color: #1f2937; background: #f8fafc; }}
+    h1 {{ margin: 0 0 4px; font-size: 24px; }}
+    .meta {{ color: #64748b; margin-bottom: 18px; }}
+    table {{ border-collapse: collapse; width: 100%; background: white; border: 1px solid #e2e8f0; }}
+    th, td {{ padding: 9px 10px; border-bottom: 1px solid #e2e8f0; text-align: left; vertical-align: top; }}
+    th {{ background: #eef2f7; color: #334155; position: sticky; top: 0; }}
+    tr:hover {{ background: #f8fafc; }}
+    code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }}
+    .source {{ font-weight: 700; white-space: nowrap; }}
+    .claude {{ color: #9a3412; }}
+    .codex {{ color: #075985; }}
+  </style>
+</head>
+<body>
+  <h1>Conversation Board</h1>
+  <div class="meta">{len(rows)} conversations, generated {generated}</div>
+  <table>
+    <thead>
+      <tr><th>Source</th><th>Title</th><th>Repo</th><th>Path</th><th>Session</th><th>Size</th><th>Updated</th><th>Local file</th></tr>
+    </thead>
+    <tbody>
+      {''.join(body_rows)}
+    </tbody>
+  </table>
+</body>
+</html>
+""")
+    return output_path
+
+
 # ---------------------------------------------------------------------------
 # Main sync logic
 # ---------------------------------------------------------------------------
@@ -1887,6 +2590,7 @@ def run_sync(args, service, root_folder_id):
     """Run one sync cycle. Returns True if any changes were made."""
     # Build local index: git_url_key -> [(project_dir, raw_git_url), ...]
     local_index = build_local_index()
+    codex_index = build_codex_index()
 
     # Resolve unmatched projects (from other machines) by scanning sibling repos
     if None in local_index:
@@ -1898,23 +2602,31 @@ def run_sync(args, service, root_folder_id):
         for project_dir, _, _, _ in entries:
             for jsonl in project_dir.glob("*.jsonl"):
                 if is_empty_conversation(jsonl):
-                    jsonl.unlink()
-                    # Also remove companion dir if it exists
-                    companion = jsonl.with_suffix("")
-                    if companion.is_dir():
-                        import shutil
-                        shutil.rmtree(companion)
+                    if not args.dry_run:
+                        jsonl.unlink(missing_ok=True)
+                        # Also remove companion dir if it exists
+                        companion = jsonl.with_suffix("")
+                        if companion.is_dir():
+                            import shutil
+                            shutil.rmtree(companion)
                     cleaned += 1
     if cleaned:
-        print(f"Cleaned {cleaned} empty conversation(s)")
+        verb = "Would clean" if args.dry_run else "Cleaned"
+        print(f"{verb} {cleaned} empty conversation(s)")
 
     git_projects = {k: v for k, v in local_index.items() if k is not None}
     no_git = local_index.get(None, [])
+    codex_git_projects = {k: v for k, v in codex_index.items() if k is not None}
+    codex_no_git = codex_index.get(None, [])
 
     print(f"Found {sum(len(v) for v in git_projects.values())} projects with git remotes, "
-          f"{len(no_git)} without")
+          f"{len(no_git)} without; "
+          f"{sum(len(v) for v in codex_git_projects.values())} Codex conversations with git remotes, "
+          f"{len(codex_no_git)} Codex without")
     for d, _, _, _ in no_git:
         print(f"  [SKIP no git] {d.name}")
+    for entry in codex_no_git:
+        print(f"  [SKIP codex no git] {entry['path'].name}")
 
     # --- DELETE LOCAL: remove local conversation files ---
     if args.delete and args.local:
@@ -2145,6 +2857,10 @@ def run_sync(args, service, root_folder_id):
                         print(f"  ║   => {pushed} pushed, {pulled} pulled, {skipped} unchanged")
             print(B)
 
+        push_printed_any = sync_codex_push(
+            service, root_folder_id, codex_git_projects, args
+        ) or push_printed_any
+
     # --- PULL: download from remote into matching local project dirs ---
     if not args.push_only:
         remote_repo_folders = list_drive_folders(service, root_folder_id, include_description=True)
@@ -2275,6 +2991,8 @@ def run_sync(args, service, root_folder_id):
             print(f"  ║ ----------------------------------------------------------------------")
             chat_filters = [c.strip() for c in args.chat_id.split(",")] if getattr(args, "chat_id", None) else None
             for subfolder_name, subfolder_id in remote_subfolders.items():
+                if is_codex_drive_subfolder(subfolder_name):
+                    continue
                 rel_path = drive_subfolder_to_rel_path(subfolder_name)
 
                 remote_sub_files = sf_files_all.get((url_key, subfolder_name), {})
@@ -2365,6 +3083,11 @@ def run_sync(args, service, root_folder_id):
                     elif remote_count > 0:
                         print(f"  ║ {subdir_label:<35s} {'--':>17}  {remote_count:>2} remote ({format_size(remote_size):>8})")
             print(B)
+
+        sync_codex_pull(
+            service, root_folder_id, codex_git_projects, args,
+            printed_any=push_printed_any,
+        )
 
     print("Done.")
     return True
@@ -2677,7 +3400,7 @@ def _run_daemon_loop(pid_file, jobs_file, service, root_folder_id):
                     pull_only=False, push_only=False, delete=False,
                     dry_run=False, verbose=False,
                     repo=job.get("repo"), chat_id=job.get("chat_id"),
-                    background=None, local=False,
+                    background=None, local=False, board=None,
                 )
                 try:
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2761,7 +3484,7 @@ def _run_watchdog(pid_file, jobs_file, log_file, service, root_folder_id):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sync Claude Code history via Google Drive")
+    parser = argparse.ArgumentParser(description="Sync Claude Code and Codex history via Google Drive")
     parser.add_argument("--pull", dest="pull_only", action="store_true", help="Only download")
     parser.add_argument("--push", dest="push_only", action="store_true", help="Only upload")
     parser.add_argument("-d", "--delete", action="store_true",
@@ -2781,6 +3504,9 @@ def main():
                         help="Remove background job(s) matching --repo/--chat filters")
     parser.add_argument("--merge", nargs=2, metavar=("SOURCE", "TARGET"),
                         help="Merge SOURCE conversation into TARGET (prefix match on session ID)")
+    parser.add_argument("--board", nargs="?", const=str(STATE_DIR / "sync_board.html"),
+                        default=None, metavar="PATH",
+                        help="Generate a local HTML board showing [claude] and [codex] conversations")
     args = parser.parse_args()
 
     # --background with no value gets None from argparse; treat as 300s default
@@ -2851,6 +3577,13 @@ def main():
 
     if not CLAUDE_PROJECTS_DIR.exists():
         CLAUDE_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    if not CODEX_HOME.exists():
+        CODEX_HOME.mkdir(parents=True, exist_ok=True)
+
+    if args.board:
+        board_path = generate_board(Path(args.board))
+        print(f"Board written: {board_path}")
+        sys.exit(0)
 
     # Merge doesn't need Drive access
     if args.merge:
