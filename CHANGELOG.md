@@ -2,6 +2,7 @@
 
 ## v0.1.7
 
+- **Fix `--push` pulling files due to 95% size guard**: the "local shrunk" guard reversed push direction when local files were smaller than remote (e.g. after trim). Now respects `--push` (never pulls) and also skips the guard when a `.pretrim.bak` exists (file was trimmed in a prior sync cycle).
 - Fix Codex Drive layout: Codex rollouts now share the normal repo/path folder with Claude conversations and put `_codex__` on each rollout JSONL filename; pulls still read legacy `_codex__<path>` folders.
 - Auto-merge conversations when two machines background-sync the same chat: detects when both local and remote have unique entries, merges by timestamp, rebuilds the parentUuid chain, and pushes the merged result
 - Add `repair_uuid_chain`: auto-fix broken `parentUuid` links and strip duplicate/orphan uuid entries caused by Claude Code crashes and retries; runs on every sync cycle and after each pull so `claude --resume` can walk the full conversation chain
