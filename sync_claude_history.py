@@ -525,21 +525,62 @@ def drive_subfolder_to_rel_path(subfolder: str) -> str:
 
 
 def codex_rel_path_to_drive_subfolder(rel_path: str) -> str:
-    """Drive subfolder for Codex rollouts at a repo-relative cwd."""
-    if rel_path == ".":
-        return f"{CODEX_DRIVE_PREFIX}root"
-    return CODEX_DRIVE_PREFIX + rel_path.replace("/", "__")
+    """Drive subfolder for Codex rollouts at a repo-relative cwd.
+
+    Codex rollouts share the same repo/path folders as Claude conversations;
+    individual rollout filenames carry the Codex prefix.
+    """
+    return rel_path_to_drive_subfolder(rel_path)
 
 
 def is_codex_drive_subfolder(subfolder: str) -> bool:
+    """Legacy Codex-only path folder marker."""
     return subfolder.startswith(CODEX_DRIVE_PREFIX)
 
 
 def codex_drive_subfolder_to_rel_path(subfolder: str) -> str:
+    if not is_codex_drive_subfolder(subfolder):
+        return drive_subfolder_to_rel_path(subfolder)
     suffix = subfolder[len(CODEX_DRIVE_PREFIX):]
     if suffix == "root":
         return "."
     return suffix.replace("__", "/")
+
+
+def codex_local_name_from_remote(fname: str) -> str:
+    """Convert a Drive Codex filename to its local rollout filename."""
+    if fname.startswith(CODEX_DRIVE_PREFIX):
+        return fname[len(CODEX_DRIVE_PREFIX):]
+    return fname
+
+
+def codex_remote_name_from_local(fname: str) -> str:
+    """Convert a local rollout filename to the prefixed Drive filename."""
+    if fname.startswith(CODEX_DRIVE_PREFIX):
+        return fname
+    return CODEX_DRIVE_PREFIX + fname
+
+
+def is_codex_remote_file(fname: str) -> bool:
+    return fname.startswith(CODEX_DRIVE_PREFIX) and fname.endswith(".jsonl")
+
+
+def is_jsonl_conversation_file(fname: str) -> bool:
+    return fname.endswith(".jsonl") and not is_codex_remote_file(fname)
+
+
+def codex_name_matches_chat_filters(fname: str, chat_filters: list[str] | None) -> bool:
+    if not chat_filters:
+        return True
+    local_name = codex_local_name_from_remote(fname)
+    stem = local_name[:-6] if local_name.endswith(".jsonl") else local_name
+    return any(
+        local_name.startswith(c)
+        or stem.startswith(c)
+        or stem.endswith(c)
+        or f"-{c}" in stem
+        for c in chat_filters
+    )
 
 
 def is_gitignored(git_root: str, rel_path: str) -> bool:
@@ -1785,9 +1826,18 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
     """Sync .jsonl files between local_dir and a Drive folder. Returns (pushed, pulled, skipped)."""
     if remote_files is None:
         remote_files = list_remote_files(service, folder_id)
+    remote_files = {
+        name: info for name, info in remote_files.items()
+        if not is_codex_remote_file(name)
+    }
     if local_jsons is None:
         local_jsons = {p.name: p for p in sorted(local_dir.glob("*.jsonl"))
-                       if not is_empty_conversation(p)}
+                       if not is_codex_remote_file(p.name) and not is_empty_conversation(p)}
+    else:
+        local_jsons = {
+            name: path for name, path in local_jsons.items()
+            if not is_codex_remote_file(name)
+        }
 
     # Filter by --chat if specified (dest=chat_id)
     chat_ids = getattr(args, "chat_id", None)
@@ -2049,7 +2099,7 @@ def _find_largest_chat(local_jsons: dict, remote_files: dict) -> str | None:
             best_size = size
             best_id = fname.replace(".jsonl", "")
     for fname, info in remote_files.items():
-        if not fname.endswith(".jsonl") or fname.startswith("_"):
+        if not is_jsonl_conversation_file(fname) or fname.startswith("_"):
             continue
         size = int(info.get("size", 0))
         if size > best_size:
@@ -2215,7 +2265,8 @@ def sync_memory(service, folder_id, local_dir: Path, args, indent="    ",
 
 
 def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=None,
-                     rel_path=".", indent="    ", remote_files=None):
+                     rel_path=".", indent="    ", remote_files=None,
+                     require_remote_prefix=True):
     """Sync Codex rollout JSONL files between local ~/.codex and Drive."""
     if remote_files is None:
         remote_files = list_remote_files(service, folder_id)
@@ -2223,6 +2274,17 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
     chat_ids = getattr(args, "chat_id", None)
     chat_filters = [c.strip() for c in chat_ids.split(",")] if chat_ids else None
     local_cwd = _codex_local_cwd(git_root, rel_path)
+    remote_by_local = {}
+    for remote_name, remote in remote_files.items():
+        if require_remote_prefix:
+            if not is_codex_remote_file(remote_name):
+                continue
+            local_name = codex_local_name_from_remote(remote_name)
+        else:
+            if remote_name.startswith("_") or not remote_name.endswith(".jsonl"):
+                continue
+            local_name = remote_name
+        remote_by_local[local_name] = (remote_name, remote)
 
     by_name = {}
     for entry in entries:
@@ -2249,8 +2311,8 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
         local_mtime = local_path.stat().st_mtime
         local_size = local_path.stat().st_size
 
-        if fname in remote_files:
-            remote = remote_files[fname]
+        if fname in remote_by_local:
+            remote_name, remote = remote_by_local[fname]
             if local_md5 == remote.get("md5Checksum", ""):
                 skipped += 1
                 continue
@@ -2263,7 +2325,7 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                 if not args.dry_run:
                     media = MediaFileUpload(str(local_path))
                     service.files().update(fileId=remote["id"], media_body=media).execute()
-                print(f"{indent}[codex {action}] {fname} ({format_size(local_size)}, {format_time(local_mtime)})")
+                print(f"{indent}[codex {action}] {remote_name} ({format_size(local_size)}, {format_time(local_mtime)})")
                 pushed += 1
             elif remote_mtime > local_mtime and not args.push_only:
                 action = "WOULD PULL" if args.dry_run else "PULLED"
@@ -2278,30 +2340,29 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                         "session_id": pulled_meta.get("session_id") or entry.get("session_id"),
                     })
                     pulled_entries.append(pulled_meta)
-                print(f"{indent}[codex {action}] {fname} ({format_size(remote_size)}, {format_time(remote_mtime)})")
+                print(f"{indent}[codex {action}] {remote_name} ({format_size(remote_size)}, {format_time(remote_mtime)})")
                 pulled += 1
             else:
                 skipped += 1
         elif not args.pull_only:
             action = "WOULD PUSH NEW" if args.dry_run else "PUSHED NEW"
+            remote_name = codex_remote_name_from_local(fname) if require_remote_prefix else fname
             if not args.dry_run:
                 media = MediaFileUpload(str(local_path))
                 service.files().create(
-                    body={"name": fname, "parents": [folder_id]},
+                    body={"name": remote_name, "parents": [folder_id]},
                     media_body=media,
                 ).execute()
-            print(f"{indent}[codex {action}] {fname} ({format_size(local_size)}, {format_time(local_mtime)})")
+            print(f"{indent}[codex {action}] {remote_name} ({format_size(local_size)}, {format_time(local_mtime)})")
             pushed += 1
 
     if not args.push_only:
-        for fname, remote in remote_files.items():
-            if fname.startswith("_") or not fname.endswith(".jsonl"):
+        for local_name, (remote_name, remote) in remote_by_local.items():
+            if chat_filters and not codex_name_matches_chat_filters(remote_name, chat_filters):
                 continue
-            if chat_filters and not any(fname.startswith(c) for c in chat_filters):
+            if local_name in by_name:
                 continue
-            if fname in by_name:
-                continue
-            local_path = _codex_rollout_path_for_remote_name(fname)
+            local_path = _codex_rollout_path_for_remote_name(local_name)
             remote_size = int(remote.get("size", 0))
             remote_mtime = datetime.fromisoformat(
                 remote["modifiedTime"].replace("Z", "+00:00")
@@ -2315,7 +2376,7 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                 pulled_meta = parse_codex_rollout(local_path)
                 pulled_meta.update({"path": local_path})
                 pulled_entries.append(pulled_meta)
-            print(f"{indent}[codex {action}] {fname} ({format_size(remote_size)}, {format_time(remote_mtime)})")
+            print(f"{indent}[codex {action}] {remote_name} ({format_size(remote_size)}, {format_time(remote_mtime)})")
             pulled += 1
 
     if not args.dry_run:
@@ -2373,10 +2434,10 @@ def sync_codex_push(service, root_folder_id, codex_git_projects: dict, args) -> 
             remote_sub_files = list_remote_files(service, subfolder_id)
             local_count = len(rel_entries)
             local_size = sum(e["path"].stat().st_size for e in rel_entries)
-            remote_count = sum(1 for k in remote_sub_files if k.endswith(".jsonl"))
+            remote_count = sum(1 for k in remote_sub_files if is_codex_remote_file(k))
             remote_size = sum(
                 int(f.get("size", 0)) for k, f in remote_sub_files.items()
-                if k.endswith(".jsonl")
+                if is_codex_remote_file(k)
             )
             label = "." if rel_path == "." else rel_path
             print(f"  ║ [codex] {label:<27s} {local_count:>2} local ({format_size(local_size):>8})  {remote_count:>2} remote ({format_size(remote_size):>8})")
@@ -2423,12 +2484,6 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
         if not repo_matches_filter(raw_url, args.repo):
             continue
         remote_subfolders = list_drive_folders(service, repo_fid)
-        codex_subfolders = {
-            name: fid for name, fid in remote_subfolders.items()
-            if is_codex_drive_subfolder(name)
-        }
-        if not codex_subfolders:
-            continue
         repo_match = local_repos.get(url_key)
         git_root = repo_match[0] if repo_match else None
         raw_url = repo_match[1] if repo_match else raw_url
@@ -2438,6 +2493,41 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
                  for e in entries if e.get("git_root")),
                 None,
             )
+
+        codex_records = []
+        for subfolder_name, subfolder_id in sorted(remote_subfolders.items()):
+            legacy_codex_folder = is_codex_drive_subfolder(subfolder_name)
+            rel_path = (
+                codex_drive_subfolder_to_rel_path(subfolder_name)
+                if legacy_codex_folder
+                else drive_subfolder_to_rel_path(subfolder_name)
+            )
+            if git_root and rel_path != "." and is_gitignored(git_root, rel_path):
+                continue
+            remote_sub_files = list_remote_files(service, subfolder_id)
+            if legacy_codex_folder:
+                codex_remote_files = {
+                    k: v for k, v in remote_sub_files.items()
+                    if not k.startswith("_") and k.endswith(".jsonl")
+                }
+            else:
+                codex_remote_files = {
+                    k: v for k, v in remote_sub_files.items()
+                    if is_codex_remote_file(k)
+                }
+            entries = local_by_url.get(url_key, {}).get(rel_path, [])
+            if codex_remote_files or entries:
+                codex_records.append((
+                    subfolder_id,
+                    legacy_codex_folder,
+                    rel_path,
+                    remote_sub_files,
+                    codex_remote_files,
+                    entries,
+                ))
+        if not codex_records:
+            continue
+
         B = "  ╠═══════════════════════════════════════════════════════════════════════════"
         if not printed_any:
             print(B)
@@ -2451,17 +2541,12 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
         print(f"  ║   ╰─> {git_root}")
         print(f"  ║ ----------------------------------------------------------------------")
 
-        for subfolder_name, subfolder_id in sorted(codex_subfolders.items()):
-            rel_path = codex_drive_subfolder_to_rel_path(subfolder_name)
-            if rel_path != "." and is_gitignored(git_root, rel_path):
-                continue
-            remote_sub_files = list_remote_files(service, subfolder_id)
-            remote_count = sum(1 for k in remote_sub_files if k.endswith(".jsonl"))
+        for (subfolder_id, legacy_codex_folder, rel_path, remote_sub_files,
+             codex_remote_files, entries) in codex_records:
+            remote_count = len(codex_remote_files)
             remote_size = sum(
-                int(f.get("size", 0)) for k, f in remote_sub_files.items()
-                if k.endswith(".jsonl")
+                int(f.get("size", 0)) for f in codex_remote_files.values()
             )
-            entries = local_by_url.get(url_key, {}).get(rel_path, [])
             local_count = len(entries)
             local_size = sum(e["path"].stat().st_size for e in entries)
             label = "." if rel_path == "." else rel_path
@@ -2472,6 +2557,7 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
                 rel_path=rel_path,
                 indent="  ║   ",
                 remote_files=remote_sub_files,
+                require_remote_prefix=not legacy_codex_folder,
             )
             if pushed or pulled:
                 if args.dry_run:
@@ -2703,7 +2789,10 @@ def run_sync(args, service, root_folder_id):
                 for fname, finfo in sub_files.items():
                     if not fname.endswith(".jsonl"):
                         continue
-                    if chat_filters and not any(fname.startswith(c) for c in chat_filters):
+                    if chat_filters and not (
+                        any(fname.startswith(c) for c in chat_filters)
+                        or codex_name_matches_chat_filters(fname, chat_filters)
+                    ):
                         continue
                     to_delete.append((raw_url, sub_name, fname, finfo["id"]))
 
@@ -2822,10 +2911,10 @@ def run_sync(args, service, root_folder_id):
                 local_count = len(local_jsons)
                 local_size = sum(p.stat().st_size for p in local_jsons.values())
                 remote_sub_files = all_sf_files.get(f"{url_key}/{subfolder_name}", {})
-                remote_count = sum(1 for k in remote_sub_files if k.endswith(".jsonl"))
+                remote_count = sum(1 for k in remote_sub_files if is_jsonl_conversation_file(k))
                 remote_size = sum(
                     int(f.get("size", 0)) for k, f in remote_sub_files.items()
-                    if k.endswith(".jsonl")
+                    if is_jsonl_conversation_file(k)
                 )
 
                 subdir_label = "." if rel_path == "." else rel_path
@@ -2960,10 +3049,10 @@ def run_sync(args, service, root_folder_id):
                     total_size = 0
                     for sf_name in remote_subfolders:
                         sf_files = sf_files_all.get((url_key, sf_name), {})
-                        total_convos += sum(1 for k in sf_files if k.endswith(".jsonl"))
+                        total_convos += sum(1 for k in sf_files if is_jsonl_conversation_file(k))
                         total_size += sum(
                             int(f.get("size", 0)) for k, f in sf_files.items()
-                            if k.endswith(".jsonl")
+                            if is_jsonl_conversation_file(k)
                         )
                     B = "  ╠═══════════════════════════════════════════════════════════════════════════"
                     if not pull_printed_first:
@@ -3001,15 +3090,15 @@ def run_sync(args, service, root_folder_id):
                 if chat_filters:
                     has_match = any(
                         any(fname.startswith(c) for c in chat_filters)
-                        for fname in remote_sub_files if fname.endswith(".jsonl")
+                        for fname in remote_sub_files if is_jsonl_conversation_file(fname)
                     )
                     if not has_match:
                         continue
 
-                remote_count = sum(1 for k in remote_sub_files if k.endswith(".jsonl"))
+                remote_count = sum(1 for k in remote_sub_files if is_jsonl_conversation_file(k))
                 remote_size = sum(
                     int(f.get("size", 0)) for k, f in remote_sub_files.items()
-                    if k.endswith(".jsonl")
+                    if is_jsonl_conversation_file(k)
                 )
 
                 subdir_label = "." if rel_path == "." else rel_path

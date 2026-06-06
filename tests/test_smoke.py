@@ -667,7 +667,7 @@ class TestCodexSupport:
         )
 
         sf = codex_rel_path_to_drive_subfolder("src/tools")
-        assert sf == "_codex__src__tools"
+        assert sf == "src__tools"
         assert codex_drive_subfolder_to_rel_path(sf) == "src/tools"
         assert codex_drive_subfolder_to_rel_path("_codex__root") == "."
 
@@ -738,10 +738,11 @@ class TestCodexSupport:
         metadata = json.loads(drive.folders[repo_folder_id]["files"]["_metadata.json"]["content"])
         assert metadata["sources"] == ["claude", "codex"]
 
-        codex_folder_id = drive.folders[repo_folder_id]["folders"]["_codex__src"]
+        codex_folder_id = drive.folders[repo_folder_id]["folders"]["src"]
         remote_files = drive.folders[codex_folder_id]["files"]
-        assert rollout.name in remote_files
-        assert json.loads(remote_files[rollout.name]["content"].splitlines()[0])["payload"]["id"] == "019e-push"
+        remote_name = f"_codex__{rollout.name}"
+        assert remote_name in remote_files
+        assert json.loads(remote_files[remote_name]["content"].splitlines()[0])["payload"]["id"] == "019e-push"
 
     def test_codex_run_sync_pulls_remote_rollout_and_indexes_it(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
@@ -757,8 +758,9 @@ class TestCodexSupport:
         url_key = sync.normalize_git_url(raw_url)
         repo_folder_id = drive.get_or_create_folder(None, url_key, drive.root_id)
         drive.folders[repo_folder_id]["description"] = raw_url
-        codex_folder_id = drive.get_or_create_folder(None, "_codex__src", repo_folder_id)
+        codex_folder_id = drive.get_or_create_folder(None, "src", repo_folder_id)
         fname = "rollout-2026-06-05T02-03-04-019e-pull.jsonl"
+        remote_name = f"_codex__{fname}"
         old_cwd = "/old/machine/repo/src"
         rows = [
             {
@@ -785,7 +787,7 @@ class TestCodexSupport:
         ]
         drive.put_file(
             codex_folder_id,
-            fname,
+            remote_name,
             "".join(json.dumps(row) + "\n" for row in rows),
             modified_time="2026-06-05T02:03:06Z",
         )
@@ -809,6 +811,57 @@ class TestCodexSupport:
             "thread_name": "remote prompt",
             "updated_at": "2026-06-05T02:03:06Z",
         }]
+
+    def test_codex_run_sync_pulls_legacy_codex_subfolder(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        repo = self._git_repo(tmp_path)
+        (repo / "src").mkdir()
+        codex_home = tmp_path / ".codex"
+        monkeypatch.setattr(sync, "CODEX_HOME", codex_home)
+        monkeypatch.setattr(sync, "CLAUDE_PROJECTS_DIR", tmp_path / "empty-claude")
+        drive = self._patch_fake_drive(monkeypatch, sync)
+
+        raw_url = "git@github.com:org/repo.git"
+        url_key = sync.normalize_git_url(raw_url)
+        repo_folder_id = drive.get_or_create_folder(None, url_key, drive.root_id)
+        drive.folders[repo_folder_id]["description"] = raw_url
+        legacy_folder_id = drive.get_or_create_folder(None, "_codex__src", repo_folder_id)
+        fname = "rollout-2026-06-05T02-03-04-019e-legacy.jsonl"
+        old_cwd = "/old/machine/repo/src"
+        rows = [
+            {
+                "timestamp": "2026-06-05T02:03:04Z",
+                "type": "session_meta",
+                "payload": {"id": "019e-legacy", "cwd": old_cwd, "git": {"repository_url": raw_url}},
+            },
+            {
+                "timestamp": "2026-06-05T02:03:06Z",
+                "type": "response_item",
+                "payload": {
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "legacy prompt"}],
+                    }
+                },
+            },
+        ]
+        drive.put_file(
+            legacy_folder_id,
+            fname,
+            "".join(json.dumps(row) + "\n" for row in rows),
+            modified_time="2026-06-05T02:03:06Z",
+        )
+        monkeypatch.setattr(sync, "scan_local_git_repos", lambda: {url_key: (str(repo), raw_url)})
+
+        out = run_sync(["--pull"], drive, drive.root_id)
+        check_format(out)
+        assert "[codex PULLED NEW]" in out
+        local_path = codex_home / "sessions" / "2026" / "06" / "05" / fname
+        assert local_path.exists()
+        pulled = [json.loads(line) for line in local_path.read_text().splitlines()]
+        assert pulled[0]["payload"]["cwd"] == str(repo / "src")
 
     def test_repair_uuid_chain(self, tmp_path):
         """repair_uuid_chain bridges broken parentUuid links."""
