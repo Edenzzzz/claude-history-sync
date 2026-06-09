@@ -3338,87 +3338,122 @@ def _kill_existing_daemon(pid_file: Path, jobs_file: Path = None):
         _kill_pid_tree(pid)
 
 
+def _passwordless_sudo_available() -> bool:
+    """True only when sudo works without an interactive password prompt."""
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "true"],
+            capture_output=True,
+            timeout=2,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def _restore_terminal() -> None:
+    """Restore tty after subprocesses (e.g. sudo) that may disable echo."""
+    if not sys.stdin.isatty():
+        return
+    try:
+        subprocess.run(
+            ["stty", "sane"],
+            stdin=sys.stdin,
+            capture_output=True,
+            timeout=2,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _setup_keepalive(keepalive_script: Path, state_dir: Path) -> str:
-    """Install a keepalive mechanism. Returns 'cron', 'watchdog', or 'none'."""
+    """Install a keepalive mechanism. Returns 'cron', 'systemd', or 'watchdog'."""
     keepalive_log = state_dir / "keepalive.log"
     cron_line = f"*/2 * * * * {keepalive_script} >> {keepalive_log} 2>&1"
+    use_sudo = _passwordless_sudo_available()
 
-    # Try cron first
-    try:
-        # Check if cron is running
-        result = subprocess.run(["pgrep", "-x", "cron"], capture_output=True)
-        if result.returncode != 0:
-            # Try to start it
-            subprocess.run(["sudo", "service", "cron", "start"],
-                           capture_output=True, timeout=5)
+    if use_sudo:
+        # Try cron first (requires passwordless sudo — never prompt interactively)
+        try:
             result = subprocess.run(["pgrep", "-x", "cron"], capture_output=True)
+            if result.returncode != 0:
+                subprocess.run(
+                    ["sudo", "-n", "service", "cron", "start"],
+                    capture_output=True,
+                    timeout=5,
+                )
+                result = subprocess.run(["pgrep", "-x", "cron"], capture_output=True)
 
-        if result.returncode == 0:
-            # Check if our cron entry already exists
-            existing = subprocess.run(
-                ["sudo", "crontab", "-u", os.environ.get("USER", "tiger"), "-l"],
-                capture_output=True, text=True, timeout=5,
+            if result.returncode == 0:
+                existing = subprocess.run(
+                    ["sudo", "-n", "crontab", "-u", os.environ.get("USER", "tiger"), "-l"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if str(keepalive_script) not in existing.stdout:
+                    new_crontab = existing.stdout.rstrip("\n")
+                    if new_crontab:
+                        new_crontab += "\n"
+                    new_crontab += cron_line + "\n"
+                    proc = subprocess.run(
+                        ["sudo", "-n", "crontab", "-u", os.environ.get("USER", "tiger"), "-"],
+                        input=new_crontab,
+                        text=True,
+                        capture_output=True,
+                        timeout=5,
+                    )
+                    if proc.returncode == 0:
+                        return "cron"
+                else:
+                    return "cron"
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+
+        # Try systemd user service (only when passwordless sudo is available)
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "status"],
+                capture_output=True,
+                timeout=5,
             )
-            if str(keepalive_script) not in existing.stdout:
-                # Add our entry
-                new_crontab = existing.stdout.rstrip("\n")
-                if new_crontab:
-                    new_crontab += "\n"
-                new_crontab += cron_line + "\n"
+            if result.returncode in (0, 3):  # 0=running, 3=no units but bus works
+                service_name = "claude-history-sync"
+                service_dir = Path.home() / ".config" / "systemd" / "user"
+                service_dir.mkdir(parents=True, exist_ok=True)
+                service_file = service_dir / f"{service_name}.service"
+                service_file.write_text(
+                    f"[Unit]\n"
+                    f"Description=Claude history sync keepalive\n\n"
+                    f"[Service]\n"
+                    f"Type=oneshot\n"
+                    f"ExecStart={keepalive_script}\n"
+                    f"Environment=SYNC_STATE_DIR={state_dir}\n\n"
+                )
+                timer_file = service_dir / f"{service_name}.timer"
+                timer_file.write_text(
+                    f"[Unit]\n"
+                    f"Description=Claude history sync keepalive timer\n\n"
+                    f"[Timer]\n"
+                    f"OnBootSec=1min\n"
+                    f"OnUnitActiveSec=2min\n"
+                    f"Persistent=true\n\n"
+                    f"[Install]\n"
+                    f"WantedBy=timers.target\n"
+                )
+                subprocess.run(["systemctl", "--user", "daemon-reload"],
+                               capture_output=True, timeout=5)
                 proc = subprocess.run(
-                    ["sudo", "crontab", "-u", os.environ.get("USER", "tiger"), "-"],
-                    input=new_crontab, text=True, capture_output=True, timeout=5,
+                    ["systemctl", "--user", "enable", "--now", f"{service_name}.timer"],
+                    capture_output=True,
+                    timeout=5,
                 )
                 if proc.returncode == 0:
-                    return "cron"
-            else:
-                return "cron"
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        pass
+                    return "systemd"
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
 
-    # Try systemd user service
-    try:
-        # Check if systemd user bus is available
-        result = subprocess.run(
-            ["systemctl", "--user", "status"],
-            capture_output=True, timeout=5,
-        )
-        if result.returncode in (0, 3):  # 0=running, 3=no units but bus works
-            service_name = "claude-history-sync"
-            service_dir = Path.home() / ".config" / "systemd" / "user"
-            service_dir.mkdir(parents=True, exist_ok=True)
-            service_file = service_dir / f"{service_name}.service"
-            service_file.write_text(
-                f"[Unit]\n"
-                f"Description=Claude history sync keepalive\n\n"
-                f"[Service]\n"
-                f"Type=oneshot\n"
-                f"ExecStart={keepalive_script}\n"
-                f"Environment=SYNC_STATE_DIR={state_dir}\n\n"
-            )
-            timer_file = service_dir / f"{service_name}.timer"
-            timer_file.write_text(
-                f"[Unit]\n"
-                f"Description=Claude history sync keepalive timer\n\n"
-                f"[Timer]\n"
-                f"OnBootSec=1min\n"
-                f"OnUnitActiveSec=2min\n"
-                f"Persistent=true\n\n"
-                f"[Install]\n"
-                f"WantedBy=timers.target\n"
-            )
-            subprocess.run(["systemctl", "--user", "daemon-reload"],
-                           capture_output=True, timeout=5)
-            proc = subprocess.run(
-                ["systemctl", "--user", "enable", "--now", f"{service_name}.timer"],
-                capture_output=True, timeout=5,
-            )
-            if proc.returncode == 0:
-                return "systemd"
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        pass
-
-    # Fallback to watchdog
+    # No passwordless sudo: skip cron/systemd (avoid sudo prompts that break the tty)
     return "watchdog"
 
 
@@ -3791,6 +3826,7 @@ def main():
         # Set up keepalive (cron preferred, watchdog fallback)
         keepalive_script = SCRIPT_DIR / "keepalive.sh"
         keepalive_method = _setup_keepalive(keepalive_script, STATE_DIR)
+        _restore_terminal()
 
         # Fork new daemon
         pid = os.fork()
@@ -3848,6 +3884,7 @@ def main():
                     print(f"Restarting background daemon ({job_count} job(s))...")
                     keepalive_script = SCRIPT_DIR / "keepalive.sh"
                     keepalive_method = _setup_keepalive(keepalive_script, STATE_DIR)
+                    _restore_terminal()
                     log_file = STATE_DIR / "sync.log"
                     pid = os.fork()
                     if pid == 0:
