@@ -1374,6 +1374,105 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     return True, before_size, after_size
 
 
+def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
+    """Trim a Codex rollout at the last ``type=compacted`` entry.
+
+    Keeps the ``session_meta`` header, the last ``compacted`` entry (which
+    carries ``replacement_history`` — the surviving context), and every line
+    after it.  Everything before is discarded.
+
+    Returns ``(trimmed, before_bytes, after_bytes)``.
+    """
+    import shutil
+
+    needle = b'"compacted"'
+    try:
+        with open(jsonl_path, "rb") as f:
+            found = False
+            overlap = b""
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                if needle in overlap + chunk:
+                    found = True
+                    break
+                overlap = chunk[-(len(needle) - 1):]
+        if not found:
+            size = jsonl_path.stat().st_size
+            return False, size, size
+    except OSError:
+        return False, 0, 0
+
+    try:
+        with open(jsonl_path, "r") as f:
+            lines = f.readlines()
+    except (OSError, UnicodeDecodeError):
+        size = jsonl_path.stat().st_size
+        return False, size, size
+
+    before_stat = jsonl_path.stat()
+    before_size = before_stat.st_size
+    before_mtime = before_stat.st_mtime
+
+    compact_idx = -1
+    header_lines = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            d = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if d.get("type") == "session_meta":
+            header_lines.append(i)
+        if d.get("type") == "compacted":
+            compact_idx = i
+
+    if compact_idx < 0:
+        return False, before_size, before_size
+
+    # Already trimmed: compacted is right after header
+    first_non_header = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            d = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if d.get("type") not in ("session_meta",):
+            first_non_header = i
+            break
+    if compact_idx == first_non_header:
+        return False, before_size, before_size
+
+    bak = jsonl_path.with_suffix(jsonl_path.suffix + ".pretrim.bak")
+    if not bak.exists():
+        shutil.copy2(jsonl_path, bak)
+
+    tmp = jsonl_path.with_suffix(jsonl_path.suffix + ".trim.tmp")
+    with open(tmp, "w") as f:
+        for i in header_lines:
+            line = lines[i]
+            f.write(line if line.endswith("\n") else line + "\n")
+        for i in range(compact_idx, len(lines)):
+            stripped = lines[i].strip()
+            if not stripped:
+                continue
+            f.write(lines[i] if lines[i].endswith("\n") else lines[i] + "\n")
+
+    tmp.replace(jsonl_path)
+    try:
+        os.utime(jsonl_path, (before_stat.st_atime, before_mtime))
+    except OSError:
+        pass
+    after_size = jsonl_path.stat().st_size
+    return True, before_size, after_size
+
+
 def repair_uuid_chain(jsonl_path: Path) -> int:
     """Fix broken parentUuid links and remove orphan/duplicate entries.
 
@@ -2384,6 +2483,20 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             if n:
                 print(f"{indent}[codex CWD REWRITE] {fname} ({n} entries -> {local_cwd})")
 
+    just_trimmed = set()
+    if not args.dry_run:
+        for fname, entry in list(by_name.items()):
+            try:
+                trimmed, before, after = trim_codex_at_last_compact(entry["path"])
+            except (OSError, ValueError):
+                continue
+            if trimmed:
+                just_trimmed.add(fname)
+                saved_pct = 100 * (before - after) / before if before else 0
+                print(f"{indent}[TRIMMED] {fname} "
+                      f"{format_size(before)} → {format_size(after)} "
+                      f"(-{saved_pct:.1f}%)")
+
     pushed = pulled = skipped = 0
     pulled_entries = []
 
@@ -2417,7 +2530,12 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                 remote["modifiedTime"].replace("Z", "+00:00")
             ).timestamp()
             remote_size = int(remote.get("size", 0))
-            if local_mtime > remote_mtime and not args.pull_only:
+            should_push = (
+                not args.pull_only
+                and (local_mtime > remote_mtime
+                     or (local_mtime >= remote_mtime and fname in just_trimmed))
+            )
+            if should_push:
                 if not args.dry_run:
                     media = MediaFileUpload(str(local_path))
                     service.files().update(fileId=remote["id"], media_body=media).execute()
@@ -2425,6 +2543,7 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             elif remote_mtime > local_mtime and not args.push_only:
                 if not args.dry_run:
                     download_file(service, remote["id"], local_path)
+                    trim_codex_at_last_compact(local_path)
                     if local_cwd:
                         rewrite_codex_cwd_if_needed(local_path, local_cwd)
                     pulled_meta = parse_codex_rollout(local_path)
@@ -2466,6 +2585,7 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             if not args.dry_run:
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 download_file(service, remote["id"], local_path)
+                trim_codex_at_last_compact(local_path)
                 if local_cwd:
                     rewrite_codex_cwd_if_needed(local_path, local_cwd)
                 pulled_meta = parse_codex_rollout(local_path)
