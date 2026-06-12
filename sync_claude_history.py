@@ -1375,20 +1375,82 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
 
 
 def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
-    """Do not trim Codex rollouts.
+    """Trim a Codex rollout to its last valid compact point.
 
-    Codex ``type=compacted`` rows are not equivalent to Claude Code's compact
-    summary entries.  The ``replacement_history`` payload is active resume
-    state; cutting the JSONL at an old compact row can make ``codex resume``
-    anchor on stale conversation context even when newer transcript rows exist.
-    Keep Codex transcripts byte-for-byte until the resume format has a
-    documented safe trim boundary.
+    Keep the ``session_meta`` header, the last valid ``type=compacted`` row,
+    and every valid JSONL row after it.  Malformed rows after the compact point
+    are dropped, but they are never used as trim boundaries.
     """
+    import shutil
+
     try:
-        size = jsonl_path.stat().st_size
+        with open(jsonl_path, "rb") as f:
+            lines = f.readlines()
     except OSError:
         return False, 0, 0
-    return False, size, size
+
+    before_stat = jsonl_path.stat()
+    before_size = before_stat.st_size
+    before_mtime = before_stat.st_mtime
+
+    parsed: list[dict | None] = [None] * len(lines)
+    header_lines: list[int] = []
+    compact_idx = -1
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            d = json.loads(stripped)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        parsed[i] = d
+        if d.get("type") == "session_meta":
+            header_lines.append(i)
+        if d.get("type") == "compacted":
+            compact_idx = i
+
+    if compact_idx < 0:
+        return False, before_size, before_size
+
+    first_non_header = 0
+    for i, d in enumerate(parsed):
+        if d is None:
+            continue
+        if d.get("type") != "session_meta":
+            first_non_header = i
+            break
+
+    invalid_retained_lines = [
+        i for i in range(compact_idx, len(lines))
+        if lines[i].strip() and parsed[i] is None
+    ]
+    header_lines = [i for i in header_lines if i < compact_idx]
+    if compact_idx == first_non_header and not invalid_retained_lines:
+        return False, before_size, before_size
+
+    bak = jsonl_path.with_suffix(jsonl_path.suffix + ".pretrim.bak")
+    if not bak.exists():
+        shutil.copy2(jsonl_path, bak)
+
+    tmp = jsonl_path.with_suffix(jsonl_path.suffix + ".trim.tmp")
+    with open(tmp, "wb") as f:
+        for i in header_lines:
+            line = lines[i]
+            f.write(line if line.endswith(b"\n") else line + b"\n")
+        for i in range(compact_idx, len(lines)):
+            if not lines[i].strip() or parsed[i] is None:
+                continue
+            line = lines[i]
+            f.write(line if line.endswith(b"\n") else line + b"\n")
+
+    tmp.replace(jsonl_path)
+    try:
+        os.utime(jsonl_path, (before_stat.st_atime, before_mtime))
+    except OSError:
+        pass
+    after_size = jsonl_path.stat().st_size
+    return True, before_size, after_size
 
 
 def repair_uuid_chain(jsonl_path: Path) -> int:

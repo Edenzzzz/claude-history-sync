@@ -727,7 +727,7 @@ class TestCodexSupport:
             "updated_at": "2026-06-03T15:20:00Z",
         }]
 
-    def test_trim_codex_at_last_compact_is_noop(self, tmp_path):
+    def test_trim_codex_at_last_compact_preserves_tail(self, tmp_path):
         from sync_claude_history import trim_codex_at_last_compact
 
         p = tmp_path / "rollout-2026-06-05T01-02-03-019e-trim.jsonl"
@@ -739,15 +739,26 @@ class TestCodexSupport:
                 {"type": "message", "role": "user", "content": "summary"}
             ]}},
             {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": "new"}},
+            b'{"type":"compacted","payload":{"replacement_history":[{"type":"message"',
+            {"type": "response_item", "payload": {"type": "message", "role": "user", "content": "tail"}},
         ]
-        p.write_text("".join(json.dumps(row) + "\n" for row in rows))
-        original = p.read_text()
+        with open(p, "wb") as f:
+            for row in rows:
+                if isinstance(row, bytes):
+                    f.write(row + b"\n")
+                else:
+                    f.write(json.dumps(row).encode() + b"\n")
 
         trimmed, before, after = trim_codex_at_last_compact(p)
-        assert trimmed is False
-        assert before == after == len(original.encode())
-        assert p.read_text() == original
-        assert not p.with_suffix(".jsonl.pretrim.bak").exists()
+        assert trimmed is True
+        assert after < before
+
+        kept = [json.loads(line) for line in p.read_bytes().splitlines()]
+        assert [row["type"] for row in kept] == [
+            "session_meta", "compacted", "response_item", "response_item"
+        ]
+        assert kept[-1]["payload"]["content"] == "tail"
+        assert p.with_suffix(".jsonl.pretrim.bak").exists()
 
     def test_board_shows_claude_and_codex_prefixes(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
