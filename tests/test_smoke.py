@@ -414,6 +414,38 @@ class TestTrimCompact:
         assert trimmed2 is False
         assert b2 == a2 == size_after_first
 
+    def test_trim_drops_malformed_rows_after_compact(self, tmp_path):
+        """Claude trim keeps the post-compact tail but drops invalid JSON rows."""
+        import json
+        from sync_claude_history import trim_at_last_compact
+
+        p = tmp_path / "conv.jsonl"
+        rows = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "message": {"role": "user", "content": "old"}},
+            {"type": "user", "uuid": "c1", "parentUuid": "u1",
+             "isCompactSummary": True,
+             "message": {"role": "user", "content": "summary"}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "c1",
+             "message": {"role": "assistant", "content": "new"}},
+            b'{"type":"user","uuid":"broken"',
+            {"type": "user", "uuid": "u2", "parentUuid": "a1",
+             "message": {"role": "user", "content": "tail"}},
+        ]
+        with open(p, "wb") as f:
+            for row in rows:
+                if isinstance(row, bytes):
+                    f.write(row + b"\n")
+                else:
+                    f.write(json.dumps(row).encode() + b"\n")
+
+        trimmed, before, after = trim_at_last_compact(p)
+        assert trimmed is True
+        assert after < before
+
+        kept = [json.loads(line) for line in p.read_bytes().splitlines()]
+        assert [row["uuid"] for row in kept] == ["c1", "a1", "u2"]
+
     def test_cwd_rewrite(self, tmp_path):
         """rewrite_cwd_if_needed updates all cwd fields and preserves mtime."""
         import json
@@ -736,8 +768,11 @@ class TestCodexSupport:
             {"type": "turn_context", "payload": {"cwd": "/repo"}},
             {"type": "response_item", "payload": {"type": "message", "role": "user", "content": "old"}},
             {"type": "compacted", "payload": {"message": "", "replacement_history": [
-                {"type": "message", "role": "user", "content": "summary"}
+                {"type": "message", "role": "user", "content": "summary"},
+                {"type": "compaction", "encrypted_content": "opaque-summary"},
             ]}},
+            {"type": "event_msg", "payload": {"message": "replay-only status"}},
+            {"type": "response_item", "payload": {"type": "function_call_output", "output": "large tool output"}},
             {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": "new"}},
             b'{"type":"compacted","payload":{"replacement_history":[{"type":"message"',
             {"type": "response_item", "payload": {"type": "message", "role": "user", "content": "tail"}},
@@ -756,6 +791,9 @@ class TestCodexSupport:
         kept = [json.loads(line) for line in p.read_bytes().splitlines()]
         assert [row["type"] for row in kept] == [
             "session_meta", "compacted", "response_item", "response_item"
+        ]
+        assert kept[1]["payload"]["replacement_history"] == [
+            {"type": "compaction", "encrypted_content": "opaque-summary"}
         ]
         assert kept[-1]["payload"]["content"] == "tail"
         assert p.with_suffix(".jsonl.pretrim.bak").exists()
@@ -889,6 +927,48 @@ class TestCodexSupport:
             "thread_name": "remote prompt",
             "updated_at": "2026-06-05T02:03:06Z",
         }]
+
+    def test_claude_pull_rewrites_cwd_from_drive_rel_path(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        repo = self._git_repo(tmp_path)
+        projects_dir = tmp_path / ".claude" / "projects"
+        codex_home = tmp_path / ".codex"
+        monkeypatch.setattr(sync, "CLAUDE_PROJECTS_DIR", projects_dir)
+        monkeypatch.setattr(sync, "CODEX_HOME", codex_home)
+        drive = self._patch_fake_drive(monkeypatch, sync)
+
+        raw_url = "git@github.com:org/repo.git"
+        url_key = sync.normalize_git_url(raw_url)
+        repo_folder_id = drive.get_or_create_folder(None, url_key, drive.root_id)
+        drive.folders[repo_folder_id]["description"] = raw_url
+        rel_path = "future_dir"
+        subfolder_id = drive.get_or_create_folder(None, sync.rel_path_to_drive_subfolder(rel_path), repo_folder_id)
+        fname = "claude-session.jsonl"
+        old_cwd = "/old/machine/repo/future_dir"
+        rows = [
+            {"type": "user", "uuid": "u1", "parentUuid": None, "cwd": old_cwd,
+             "message": {"role": "user", "content": "remote"}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1", "cwd": old_cwd,
+             "message": {"role": "assistant", "content": "reply"}},
+        ]
+        drive.put_file(
+            subfolder_id,
+            fname,
+            "".join(json.dumps(row) + "\n" for row in rows),
+            modified_time="2026-06-05T02:03:06Z",
+        )
+        monkeypatch.setattr(sync, "scan_local_git_repos", lambda: {url_key: (str(repo), raw_url)})
+
+        out = run_sync(["--pull"], drive, drive.root_id)
+        check_format(out)
+        assert "0 local" in out
+        assert "1 remote" in out
+
+        local_dir = sync.claude_project_dir_for_path(repo / rel_path)
+        pulled = [json.loads(line) for line in (local_dir / fname).read_text().splitlines()]
+        assert pulled[0]["cwd"] == str(repo / rel_path)
+        assert pulled[1]["cwd"] == str(repo / rel_path)
 
     def test_codex_run_sync_pulls_legacy_codex_subfolder(self, tmp_path, monkeypatch):
         import sync_claude_history as sync

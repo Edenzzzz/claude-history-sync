@@ -12,6 +12,8 @@ All tests live in `tests/` and use pytest. **Run `pytest tests/ -v` and ensure a
 
 When adding a new flag or functionality, add corresponding test(s) in `tests/test_smoke.py`. Tests check both exit codes and output formatting (no tracebacks, no doubled borders).
 
+When testing resume/trim logic after compaction, verify it aligns with both Claude Code and Codex reconstruction behavior. In particular, check that the retained tail conversation matches the pre-upload/pre-trim conversation tail, and that resuming the reconstructed conversation does not run out of context.
+
 ```bash
 pytest tests/ -v           # run all tests
 pytest tests/ -v -k "dry"  # run subset

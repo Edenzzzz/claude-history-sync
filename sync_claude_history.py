@@ -488,6 +488,12 @@ def resolve_claude_project_path(project_dir_name: str) -> str | None:
     return _resolve(1, "/" + segments[0], 0)
 
 
+def claude_project_dir_for_path(path: str | Path) -> Path:
+    """Return Claude's project directory path for an absolute cwd."""
+    encoded = str(path).replace("/", "-").replace("_", "-").replace(".", "-")
+    return CLAUDE_PROJECTS_DIR / encoded
+
+
 def find_git_root(path: str) -> str | None:
     """Walk up from path to find the nearest git root."""
     p = Path(path)
@@ -794,12 +800,16 @@ def _codex_rollout_path_for_remote_name(fname: str, codex_home: Path | None = No
     return codex_home / "sessions" / "synced" / fname
 
 
-def _codex_local_cwd(git_root: str | None, rel_path: str | None) -> str | None:
+def repo_local_cwd(git_root: str | None, rel_path: str | None) -> str | None:
     if not git_root:
         return None
     if not rel_path or rel_path == ".":
         return git_root
     return os.path.join(git_root, rel_path)
+
+
+def _codex_local_cwd(git_root: str | None, rel_path: str | None) -> str | None:
+    return repo_local_cwd(git_root, rel_path)
 
 
 def _first_codex_cwd_in_file(jsonl_path: Path) -> str | None:
@@ -1236,8 +1246,8 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     """Trim a conversation at the last ``isCompactSummary`` entry.
 
     Keeps any leading ``type=summary`` entries (title metadata), the last
-    ``isCompactSummary`` entry itself (with its ``parentUuid`` patched to
-    ``None`` so it acts as the new root), and every entry that follows it.
+    ``isCompactSummary`` entry itself, and every valid JSONL entry that
+    follows it.
     Everything before the last compact point is discarded — that content is
     already captured by the summary message itself, and dropping it lets
     ``claude --resume`` load huge conversations that would otherwise exceed
@@ -1299,10 +1309,16 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     if compact_idx < leading_summary_end:
         return False, before_size, before_size
 
+    invalid_retained_lines = [
+        i for i in range(compact_idx, len(lines))
+        if lines[i].strip() and parsed[i] is None
+    ]
+
     # Idempotency check: if the compact entry is already the first
-    # non-summary line, the file is already trimmed and nothing needs to
-    # change.  Skip the rewrite to avoid churning mtime/md5 every sync cycle.
-    if compact_idx == leading_summary_end:
+    # non-summary line and all retained rows are valid JSON, the file is
+    # already trimmed. Skip the rewrite to avoid churning mtime/md5 every sync
+    # cycle.
+    if compact_idx == leading_summary_end and not invalid_retained_lines:
         return False, before_size, before_size
 
     compact_entry = parsed[compact_idx]
@@ -1357,6 +1373,8 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
         for i in range(compact_idx + 1, len(lines)):
             if not lines[i].strip():
                 continue
+            if parsed[i] is None:
+                continue
             if i in fixed_lines:
                 f.write(fixed_lines[i])
             else:
@@ -1378,8 +1396,11 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     """Trim a Codex rollout to its last valid compact point.
 
     Keep the ``session_meta`` header, the last valid ``type=compacted`` row,
-    and every valid JSONL row after it.  Malformed rows after the compact point
-    are dropped, but they are never used as trim boundaries.
+    and the post-compact message/function-call tail.  Bulky replay-only rows
+    (event messages and function-call outputs) are dropped so ``codex resume``
+    can reconstruct the conversation without overflowing context.  Malformed
+    rows after the compact point are dropped, but they are never used as trim
+    boundaries.
     """
     import shutil
 
@@ -1426,7 +1447,38 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
         if lines[i].strip() and parsed[i] is None
     ]
     header_lines = [i for i in header_lines if i < compact_idx]
-    if compact_idx == first_non_header and not invalid_retained_lines:
+
+    compact_entry = dict(parsed[compact_idx])
+    payload = compact_entry.get("payload")
+    compact_rewrite_needed = False
+    if isinstance(payload, dict):
+        replacement_history = payload.get("replacement_history")
+        if isinstance(replacement_history, list):
+            compaction_items = [
+                item for item in replacement_history
+                if isinstance(item, dict) and item.get("type") == "compaction"
+            ]
+            if compaction_items:
+                payload = dict(payload)
+                payload["replacement_history"] = [compaction_items[-1]]
+                compact_entry["payload"] = payload
+                compact_rewrite_needed = replacement_history != [compaction_items[-1]]
+
+    dropped_retained_lines = []
+    for i in range(compact_idx + 1, len(lines)):
+        if not lines[i].strip() or parsed[i] is None:
+            continue
+        d = parsed[i]
+        payload = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+        if d.get("type") == "event_msg":
+            dropped_retained_lines.append(i)
+        elif d.get("type") == "response_item" and payload.get("type") == "function_call_output":
+            dropped_retained_lines.append(i)
+
+    if (compact_idx == first_non_header
+            and not invalid_retained_lines
+            and not compact_rewrite_needed
+            and not dropped_retained_lines):
         return False, before_size, before_size
 
     bak = jsonl_path.with_suffix(jsonl_path.suffix + ".pretrim.bak")
@@ -1440,6 +1492,15 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
             f.write(line if line.endswith(b"\n") else line + b"\n")
         for i in range(compact_idx, len(lines)):
             if not lines[i].strip() or parsed[i] is None:
+                continue
+            d = parsed[i]
+            if i == compact_idx:
+                f.write(json.dumps(compact_entry, ensure_ascii=False).encode() + b"\n")
+                continue
+            if d.get("type") == "event_msg":
+                continue
+            payload = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+            if d.get("type") == "response_item" and payload.get("type") == "function_call_output":
                 continue
             line = lines[i]
             f.write(line if line.endswith(b"\n") else line + b"\n")
@@ -1981,7 +2042,7 @@ def repo_matches_filter(raw_url: str, repo_filter: str | None) -> bool:
 
 
 def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
-               remote_files=None, local_jsons=None):
+               remote_files=None, local_jsons=None, local_cwd=None):
     """Sync .jsonl files between local_dir and a Drive folder. Returns (pushed, pulled, skipped)."""
     if remote_files is None:
         remote_files = list_remote_files(service, folder_id)
@@ -2008,7 +2069,8 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
     # Resolve this local project dir back to its absolute cwd so we can
     # rewrite cwd fields on pull (the pulled JSONL may carry a different
     # machine's absolute path, which would make ``claude --resume`` refuse).
-    local_cwd = resolve_claude_project_path(local_dir.name)
+    if local_cwd is None:
+        local_cwd = resolve_claude_project_path(local_dir.name)
 
     # Rewrite cwd fields on any existing local file whose entries still carry
     # another machine's cwd. This runs every sync so it self-heals files that
@@ -3246,6 +3308,7 @@ def run_sync(args, service, root_folder_id):
                 pushed, pulled, skipped = sync_files(
                     service, subfolder_id, project_dir, args, indent="  ║   ",
                     remote_files=remote_sub_files, local_jsons=local_jsons,
+                    local_cwd=repo_local_cwd(git_root, rel_path),
                 )
                 # Sync memory (skip when filtering by specific chats)
                 if not getattr(args, "chat_id", None):
@@ -3444,6 +3507,7 @@ def run_sync(args, service, root_folder_id):
                     pushed, pulled, skipped = sync_files(
                         service, subfolder_id, project_dir, args, indent="  ║   ",
                         remote_files=remote_sub_files, local_jsons=local_jsons,
+                        local_cwd=repo_local_cwd(pull_git_root, rel_path),
                     )
                     if not getattr(args, "chat_id", None):
                         mem_pushed, mem_pulled = sync_memory(
@@ -3466,8 +3530,7 @@ def run_sync(args, service, root_folder_id):
                         else:
                             full_path = os.path.join(pull_git_root, rel_path)
                         # Claude encodes /foo/bar_baz as -foo-bar-baz
-                        encoded = full_path.replace("/", "-").replace("_", "-").replace(".", "-")
-                        project_dir = CLAUDE_PROJECTS_DIR / encoded
+                        project_dir = claude_project_dir_for_path(full_path)
                         if not args.dry_run:
                             project_dir.mkdir(parents=True, exist_ok=True)
                         local_jsons = {}
@@ -3487,6 +3550,7 @@ def run_sync(args, service, root_folder_id):
                         pushed, pulled, skipped = sync_files(
                             service, subfolder_id, project_dir, args, indent="  ║   ",
                             remote_files=remote_sub_files, local_jsons=local_jsons,
+                            local_cwd=full_path,
                         )
                         if not getattr(args, "chat_id", None):
                             mem_pushed, mem_pulled = sync_memory(
