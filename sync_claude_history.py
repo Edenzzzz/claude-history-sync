@@ -1418,13 +1418,6 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     compact_idx = -1
     header_lines = []
     parsed: list[dict | None] = [None] * len(lines)
-    invalid_compact_lines: list[int] = []
-
-    def is_raw_compact_line(line: bytes) -> bool:
-        prefix = line.lstrip()[:512]
-        if not prefix.startswith(b"{"):
-            return False
-        return re.search(rb'"type"\s*:\s*"compacted"', prefix) is not None
 
     for i, line in enumerate(lines):
         stripped = line.strip()
@@ -1433,8 +1426,9 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
         try:
             d = json.loads(stripped)
         except (json.JSONDecodeError, UnicodeDecodeError):
-            if is_raw_compact_line(stripped):
-                invalid_compact_lines.append(i)
+            # Keep parsing after corrupt rows.  A failed compact write can
+            # splice records together; that row is not a trustworthy trim
+            # boundary, but later valid rows are still part of the transcript.
             continue
         parsed[i] = d
         if d.get("type") == "session_meta":
@@ -1445,15 +1439,6 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     if compact_idx < 0:
         return False, before_size, before_size
 
-    stop_idx = len(lines)
-    later_invalid_compacts = [i for i in invalid_compact_lines if i > compact_idx]
-    if later_invalid_compacts:
-        # A malformed compact record means Codex attempted to replace the
-        # already-near-limit tail but failed to persist valid JSONL. Keeping the
-        # corrupt marker or later tail makes pulled sessions fail to load or
-        # immediately overflow, so preserve the last valid state before it.
-        stop_idx = min(later_invalid_compacts)
-
     first_non_header = 0
     for i, d in enumerate(parsed):
         if d is None:
@@ -1463,14 +1448,12 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
             break
 
     invalid_retained_lines = [
-        i for i in range(compact_idx, stop_idx)
+        i for i in range(compact_idx, len(lines))
         if lines[i].strip() and parsed[i] is None
     ]
     header_lines = [i for i in header_lines if i < compact_idx]
 
-    if (compact_idx == first_non_header
-            and stop_idx == len(lines)
-            and not invalid_retained_lines):
+    if compact_idx == first_non_header and not invalid_retained_lines:
         return False, before_size, before_size
 
     bak = jsonl_path.with_suffix(jsonl_path.suffix + ".pretrim.bak")
@@ -1482,7 +1465,7 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
         for i in header_lines:
             line = lines[i]
             f.write(line if line.endswith(b"\n") else line + b"\n")
-        for i in range(compact_idx, stop_idx):
+        for i in range(compact_idx, len(lines)):
             if not lines[i].strip() or parsed[i] is None:
                 continue
             line = lines[i]

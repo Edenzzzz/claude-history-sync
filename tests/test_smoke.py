@@ -755,7 +755,7 @@ class TestCodexSupport:
         assert trimmed2 is False
         assert before2 == after2 == after
 
-    def test_trim_codex_cuts_off_malformed_later_compact(self, tmp_path):
+    def test_trim_codex_drops_malformed_compact_but_keeps_later_tail(self, tmp_path):
         from sync_claude_history import trim_codex_at_last_compact
 
         p = tmp_path / "rollout-2026-06-05T01-02-03-019e-badcompact.jsonl"
@@ -769,6 +769,9 @@ class TestCodexSupport:
         after_bad = {"type": "response_item", "payload": {
             "type": "message", "role": "assistant", "content": "too late"
         }}
+        interrupted = {"type": "event_msg", "payload": {
+            "type": "turn_aborted", "reason": "interrupted"
+        }}
 
         with open(p, "wb") as f:
             f.write(json.dumps(header).encode() + b"\n")
@@ -777,15 +780,24 @@ class TestCodexSupport:
             f.write(b'{"timestamp":"2026-06-01T03:59:38Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message"')
             f.write(b'{"timestamp":"2026-06-12T01:03:52Z","type":"event_msg","payload":{"type":"agent_message"}}\n')
             f.write(json.dumps(after_bad).encode() + b"\n")
+            f.write(b"\x00\x00not-json\n")
+            f.write(json.dumps(interrupted).encode() + b"\n")
 
         trimmed, before, after = trim_codex_at_last_compact(p)
         assert trimmed is True
         assert after < before
 
         kept = [json.loads(line) for line in p.read_bytes().splitlines()]
-        assert [row["type"] for row in kept] == ["session_meta", "compacted", "response_item"]
-        assert kept[-1]["payload"]["content"] == "still valid"
-        assert all(row["type"] != "event_msg" for row in kept)
+        assert [row["type"] for row in kept] == [
+            "session_meta",
+            "compacted",
+            "response_item",
+            "response_item",
+            "event_msg",
+        ]
+        assert kept[2]["payload"]["content"] == "still valid"
+        assert kept[3]["payload"]["content"] == "too late"
+        assert kept[4]["payload"]["type"] == "turn_aborted"
 
     def test_board_shows_claude_and_codex_prefixes(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
