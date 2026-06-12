@@ -3035,6 +3035,38 @@ def run_sync(args, service, root_folder_id):
                     title_str = f'"{title}"' if title else "(untitled)"
                     size = format_size(jsonl_path.stat().st_size)
                     to_delete.append((jsonl_path, title_str, size))
+        # Search Codex rollouts
+        for url_key, entries in codex_git_projects.items():
+            raw_url = next((e.get("git_url") for e in entries if e.get("git_url")), url_key)
+            if not repo_matches_filter(raw_url, args.repo):
+                continue
+            for entry in entries:
+                rollout_path = entry["path"]
+                sid = entry.get("session_id", "")
+                fname = rollout_path.name
+                if chat_filters and not codex_name_matches_chat_filters(
+                    fname, chat_filters, title=entry.get("title"),
+                    session_id=sid
+                ):
+                    continue
+                title = entry.get("title")
+                title_str = f'[codex] "{title}"' if title else "[codex] (untitled)"
+                size = format_size(rollout_path.stat().st_size)
+                to_delete.append((rollout_path, title_str, size))
+        if chat_filters and not args.repo:
+            for entry in codex_no_git:
+                rollout_path = entry["path"]
+                sid = entry.get("session_id", "")
+                fname = rollout_path.name
+                if not codex_name_matches_chat_filters(
+                    fname, chat_filters, title=entry.get("title"),
+                    session_id=sid
+                ):
+                    continue
+                title = entry.get("title")
+                title_str = f'[codex] "{title}"' if title else "[codex] (untitled)"
+                size = format_size(rollout_path.stat().st_size)
+                to_delete.append((rollout_path, title_str, size))
 
         if not to_delete:
             print("No matching local conversations to delete.")
