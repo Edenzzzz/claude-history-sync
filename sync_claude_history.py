@@ -2387,11 +2387,26 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
     pushed = pulled = skipped = 0
     pulled_entries = []
 
+    titles_file = remote_files.get("_codex_titles.json")
+    codex_titles = {}
+    if titles_file:
+        try:
+            codex_titles = json.loads(download_string(service, titles_file["id"]))
+        except (json.JSONDecodeError, Exception):
+            pass
+    titles_changed = False
+
     for fname, entry in by_name.items():
         local_path = entry["path"]
         local_md5 = local_file_md5(local_path)
         local_mtime = local_path.stat().st_mtime
         local_size = local_path.stat().st_size
+
+        sid = entry.get("session_id", "")
+        title = entry.get("title")
+        if sid and title and title != sid and codex_titles.get(sid) != title:
+            codex_titles[sid] = title
+            titles_changed = True
 
         if fname in remote_by_local:
             remote_name, remote = remote_by_local[fname]
@@ -2413,10 +2428,11 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                     if local_cwd:
                         rewrite_codex_cwd_if_needed(local_path, local_cwd)
                     pulled_meta = parse_codex_rollout(local_path)
+                    pulled_sid = pulled_meta.get("session_id") or entry.get("session_id") or ""
                     pulled_meta.update({
                         "path": local_path,
-                        "title": entry.get("title"),
-                        "session_id": pulled_meta.get("session_id") or entry.get("session_id"),
+                        "title": codex_titles.get(pulled_sid) or entry.get("title"),
+                        "session_id": pulled_sid,
                     })
                     pulled_entries.append(pulled_meta)
                 pulled += 1
@@ -2453,12 +2469,25 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                 if local_cwd:
                     rewrite_codex_cwd_if_needed(local_path, local_cwd)
                 pulled_meta = parse_codex_rollout(local_path)
-                pulled_meta.update({"path": local_path})
+                pull_sid = remote_sid or pulled_meta.get("session_id", "")
+                pulled_meta.update({
+                    "path": local_path,
+                    "title": codex_titles.get(pull_sid),
+                })
                 pulled_entries.append(pulled_meta)
             pulled += 1
 
     if not args.dry_run:
         upsert_codex_session_index(pulled_entries)
+
+    if titles_changed and not args.dry_run:
+        upload_string(
+            service,
+            json.dumps(codex_titles, indent=2),
+            "_codex_titles.json",
+            folder_id,
+            existing_id=titles_file["id"] if titles_file else None,
+        )
 
     return pushed, pulled, skipped
 
