@@ -692,6 +692,7 @@ def parse_codex_rollout(jsonl_path: Path) -> dict:
         "updated_at": None,
         "first_user_message": None,
     }
+    fallback_first_user_message = None
     for entry in _iter_jsonl_objects(jsonl_path):
         ts = _parse_time_value(entry.get("timestamp"))
         if ts is not None:
@@ -710,8 +711,12 @@ def parse_codex_rollout(jsonl_path: Path) -> dict:
                 meta["git_url"] = meta["git_url"] or git_info.get("repository_url")
         elif typ == "turn_context":
             meta["cwd"] = meta["cwd"] or payload.get("cwd")
-        elif meta["first_user_message"] is None:
-            item = payload.get("item") if isinstance(payload, dict) else None
+        elif typ == "event_msg" and payload.get("type") == "user_message":
+            message = payload.get("message")
+            if meta["first_user_message"] is None and isinstance(message, str) and message.strip():
+                meta["first_user_message"] = message.strip()
+        elif fallback_first_user_message is None:
+            item = payload.get("item") if isinstance(payload.get("item"), dict) else payload
             if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "user":
                 content = item.get("content")
                 if isinstance(content, list):
@@ -720,16 +725,94 @@ def parse_codex_rollout(jsonl_path: Path) -> dict:
                         if isinstance(part, dict) and isinstance(part.get("text"), str):
                             parts.append(part["text"])
                     if parts:
-                        meta["first_user_message"] = " ".join(parts).strip()
+                        fallback_first_user_message = " ".join(parts).strip()
                 elif isinstance(content, str):
-                    meta["first_user_message"] = content.strip()
+                    fallback_first_user_message = content.strip()
 
     if meta["updated_at"] is None:
         try:
             meta["updated_at"] = jsonl_path.stat().st_mtime
         except OSError:
             pass
+    if meta["first_user_message"] is None:
+        meta["first_user_message"] = fallback_first_user_message
     return meta
+
+
+def _codex_payload_item(entry: dict) -> dict:
+    payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+    item = payload.get("item")
+    return item if isinstance(item, dict) else payload
+
+
+def _codex_message_text(item: dict) -> str:
+    content = item.get("content")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return " ".join(parts).strip()
+    if isinstance(content, str):
+        return content.strip()
+    return ""
+
+
+def _codex_is_indexable_user_text(text: str) -> bool:
+    text = text.lstrip()
+    if not text:
+        return False
+    internal_prefixes = (
+        "<environment_context",
+        "<codex_internal_context",
+        "<goal_context",
+        "<turn_aborted",
+        "# AGENTS.md instructions",
+    )
+    return not text.startswith(internal_prefixes)
+
+
+def _codex_picker_anchor_lines(parsed: list[dict | None], compact_idx: int) -> list[int]:
+    """Return pre-compact opening rows needed for Codex picker indexing.
+
+    Codex reconstructs resume context from the compacted row, but its session
+    backfill derives title/first_user_message from the startup user-message
+    event.  Keeping only ``session_meta`` + ``compacted`` resumes by UUID but
+    makes the session disappear from the picker.
+    """
+    response_anchor_idx = None
+    event_anchor_idx = None
+    first_content_idx = None
+
+    for i in range(compact_idx):
+        entry = parsed[i]
+        if entry is None or entry.get("type") == "session_meta":
+            continue
+        if first_content_idx is None:
+            first_content_idx = i
+
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+        if entry.get("type") == "event_msg" and payload.get("type") == "user_message":
+            message = payload.get("message")
+            if isinstance(message, str) and _codex_is_indexable_user_text(message):
+                event_anchor_idx = i
+                break
+
+        item = _codex_payload_item(entry)
+        if (entry.get("type") == "response_item"
+                and item.get("type") == "message"
+                and item.get("role") == "user"):
+            text = _codex_message_text(item)
+            if _codex_is_indexable_user_text(text):
+                response_anchor_idx = i
+
+    anchor_idx = event_anchor_idx if event_anchor_idx is not None else response_anchor_idx
+    if anchor_idx is None or first_content_idx is None:
+        return []
+    return [
+        i for i in range(first_content_idx, anchor_idx + 1)
+        if parsed[i] is not None and parsed[i].get("type") != "session_meta"
+    ]
 
 
 def _load_codex_session_index(codex_home: Path | None = None) -> dict:
@@ -1395,8 +1478,11 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
 def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     """Trim a Codex rollout to its last valid compact point.
 
-    Keep the ``session_meta`` header, the last valid ``type=compacted`` row,
-    and the post-compact message/function-call tail.  Bulky replay-only rows
+    Keep the ``session_meta`` header, the startup rows through the first real
+    user-message event, the last valid ``type=compacted`` row, and the
+    post-compact message/function-call tail.  Codex uses that early
+    user-message event to backfill picker titles; the compacted row remains
+    the resume reconstruction boundary.  Bulky replay-only rows after compact
     (event messages and function-call outputs) are dropped so ``codex resume``
     can reconstruct the conversation without overflowing context.  Malformed
     rows after the compact point are dropped, but they are never used as trim
@@ -1434,19 +1520,16 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     if compact_idx < 0:
         return False, before_size, before_size
 
-    first_non_header = 0
-    for i, d in enumerate(parsed):
-        if d is None:
-            continue
-        if d.get("type") != "session_meta":
-            first_non_header = i
-            break
-
     invalid_retained_lines = [
         i for i in range(compact_idx, len(lines))
         if lines[i].strip() and parsed[i] is None
     ]
     header_lines = [i for i in header_lines if i < compact_idx]
+    anchor_lines = _codex_picker_anchor_lines(parsed, compact_idx)
+    prefix_lines = header_lines + [
+        i for i in anchor_lines
+        if i not in set(header_lines)
+    ]
 
     compact_entry = dict(parsed[compact_idx])
     payload = compact_entry.get("payload")
@@ -1475,7 +1558,11 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
         elif d.get("type") == "response_item" and payload.get("type") == "function_call_output":
             dropped_retained_lines.append(i)
 
-    if (compact_idx == first_non_header
+    valid_before_compact = [
+        i for i in range(compact_idx)
+        if lines[i].strip() and parsed[i] is not None
+    ]
+    if (valid_before_compact == prefix_lines
             and not invalid_retained_lines
             and not compact_rewrite_needed
             and not dropped_retained_lines):
@@ -1487,7 +1574,7 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
 
     tmp = jsonl_path.with_suffix(jsonl_path.suffix + ".trim.tmp")
     with open(tmp, "wb") as f:
-        for i in header_lines:
+        for i in prefix_lines:
             line = lines[i]
             f.write(line if line.endswith(b"\n") else line + b"\n")
         for i in range(compact_idx, len(lines)):

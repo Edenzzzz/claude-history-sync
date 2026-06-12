@@ -760,13 +760,17 @@ class TestCodexSupport:
         }]
 
     def test_trim_codex_at_last_compact_preserves_tail(self, tmp_path):
-        from sync_claude_history import trim_codex_at_last_compact
+        from sync_claude_history import parse_codex_rollout, trim_codex_at_last_compact
 
         p = tmp_path / "rollout-2026-06-05T01-02-03-019e-trim.jsonl"
         rows = [
             {"type": "session_meta", "payload": {"id": "019e-trim", "cwd": "/repo"}},
             {"type": "turn_context", "payload": {"cwd": "/repo"}},
+            {"type": "response_item", "payload": {
+                "type": "message", "role": "user", "content": "<environment_context>ignored</environment_context>"
+            }},
             {"type": "response_item", "payload": {"type": "message", "role": "user", "content": "old"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "old"}},
             {"type": "compacted", "payload": {"message": "", "replacement_history": [
                 {"type": "message", "role": "user", "content": "summary"},
                 {"type": "compaction", "encrypted_content": "opaque-summary"},
@@ -790,12 +794,15 @@ class TestCodexSupport:
 
         kept = [json.loads(line) for line in p.read_bytes().splitlines()]
         assert [row["type"] for row in kept] == [
-            "session_meta", "compacted", "response_item", "response_item"
+            "session_meta", "turn_context", "response_item", "response_item",
+            "event_msg", "compacted", "response_item", "response_item"
         ]
-        assert kept[1]["payload"]["replacement_history"] == [
+        assert kept[4]["payload"]["message"] == "old"
+        assert kept[5]["payload"]["replacement_history"] == [
             {"type": "compaction", "encrypted_content": "opaque-summary"}
         ]
         assert kept[-1]["payload"]["content"] == "tail"
+        assert parse_codex_rollout(p)["first_user_message"] == "old"
         assert p.with_suffix(".jsonl.pretrim.bak").exists()
 
     def test_board_shows_claude_and_codex_prefixes(self, tmp_path, monkeypatch):
