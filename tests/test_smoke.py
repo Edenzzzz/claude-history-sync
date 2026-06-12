@@ -727,7 +727,7 @@ class TestCodexSupport:
             "updated_at": "2026-06-03T15:20:00Z",
         }]
 
-    def test_trim_codex_at_last_compact(self, tmp_path):
+    def test_trim_codex_at_last_compact_is_noop(self, tmp_path):
         from sync_claude_history import trim_codex_at_last_compact
 
         p = tmp_path / "rollout-2026-06-05T01-02-03-019e-trim.jsonl"
@@ -741,63 +741,13 @@ class TestCodexSupport:
             {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": "new"}},
         ]
         p.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        original = p.read_text()
 
         trimmed, before, after = trim_codex_at_last_compact(p)
-        assert trimmed is True
-        assert after < before
-
-        kept = [json.loads(line) for line in p.read_text().splitlines()]
-        assert [row["type"] for row in kept] == ["session_meta", "compacted", "response_item"]
-        assert kept[1]["payload"]["replacement_history"][0]["content"] == "summary"
-        assert p.with_suffix(".jsonl.pretrim.bak").exists()
-
-        trimmed2, before2, after2 = trim_codex_at_last_compact(p)
-        assert trimmed2 is False
-        assert before2 == after2 == after
-
-    def test_trim_codex_drops_malformed_compact_but_keeps_later_tail(self, tmp_path):
-        from sync_claude_history import trim_codex_at_last_compact
-
-        p = tmp_path / "rollout-2026-06-05T01-02-03-019e-badcompact.jsonl"
-        header = {"type": "session_meta", "payload": {"id": "019e-badcompact", "cwd": "/repo"}}
-        compact = {"type": "compacted", "payload": {"message": "", "replacement_history": [
-            {"type": "message", "role": "user", "content": "summary"}
-        ]}}
-        before_bad = {"type": "response_item", "payload": {
-            "type": "message", "role": "assistant", "content": "still valid"
-        }}
-        after_bad = {"type": "response_item", "payload": {
-            "type": "message", "role": "assistant", "content": "too late"
-        }}
-        interrupted = {"type": "event_msg", "payload": {
-            "type": "turn_aborted", "reason": "interrupted"
-        }}
-
-        with open(p, "wb") as f:
-            f.write(json.dumps(header).encode() + b"\n")
-            f.write(json.dumps(compact).encode() + b"\n")
-            f.write(json.dumps(before_bad).encode() + b"\n")
-            f.write(b'{"timestamp":"2026-06-01T03:59:38Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message"')
-            f.write(b'{"timestamp":"2026-06-12T01:03:52Z","type":"event_msg","payload":{"type":"agent_message"}}\n')
-            f.write(json.dumps(after_bad).encode() + b"\n")
-            f.write(b"\x00\x00not-json\n")
-            f.write(json.dumps(interrupted).encode() + b"\n")
-
-        trimmed, before, after = trim_codex_at_last_compact(p)
-        assert trimmed is True
-        assert after < before
-
-        kept = [json.loads(line) for line in p.read_bytes().splitlines()]
-        assert [row["type"] for row in kept] == [
-            "session_meta",
-            "compacted",
-            "response_item",
-            "response_item",
-            "event_msg",
-        ]
-        assert kept[2]["payload"]["content"] == "still valid"
-        assert kept[3]["payload"]["content"] == "too late"
-        assert kept[4]["payload"]["type"] == "turn_aborted"
+        assert trimmed is False
+        assert before == after == len(original.encode())
+        assert p.read_text() == original
+        assert not p.with_suffix(".jsonl.pretrim.bak").exists()
 
     def test_board_shows_claude_and_codex_prefixes(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
