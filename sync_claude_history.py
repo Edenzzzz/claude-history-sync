@@ -801,6 +801,35 @@ def _codex_picker_anchor_lines(parsed: list[dict | None], start_idx: int, end_id
     return []
 
 
+def _codex_tail_user_event(parsed: list[dict | None], start_idx: int) -> dict | None:
+    """Build a Codex picker event from the retained post-compact user tail."""
+    for i in range(len(parsed) - 1, start_idx - 1, -1):
+        entry = parsed[i]
+        if entry is None or entry.get("type") != "response_item":
+            continue
+        item = _codex_payload_item(entry)
+        if item.get("type") != "message" or item.get("role") != "user":
+            continue
+        text = _codex_message_text(item)
+        if not _codex_is_indexable_user_text(text):
+            continue
+        event = {
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": text,
+                "images": [],
+                "local_images": [],
+                "text_elements": [],
+            },
+        }
+        timestamp = entry.get("timestamp")
+        if isinstance(timestamp, str) and timestamp:
+            event["timestamp"] = timestamp
+        return event
+    return None
+
+
 def _load_codex_session_index(codex_home: Path | None = None) -> dict:
     codex_home = Path(codex_home or CODEX_HOME).expanduser()
     index_path = codex_home / "session_index.jsonl"
@@ -1464,14 +1493,14 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
 def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     """Trim a Codex rollout to its last valid compact point.
 
-    Keep the ``session_meta`` header, the startup rows through the first real
-    user-message event, the last valid ``type=compacted`` row, and the
-    post-compact message/function-call tail.  Codex uses that early
-    user-message event to backfill picker titles; the compacted row remains
-    the resume reconstruction boundary.  Bulky replay-only rows after compact
-    (event messages and function-call outputs) are dropped so ``codex resume``
-    can reconstruct the conversation without overflowing context.  Malformed
-    rows after the compact point are dropped, but they are never used as trim
+    Keep the ``session_meta`` header, the last valid ``type=compacted`` row, a
+    lightweight user-message event for the retained post-compact tail, and the
+    post-compact message/function-call tail.  Codex uses the user-message event
+    to backfill picker titles; the compacted row remains the resume
+    reconstruction boundary.  Bulky replay-only rows after compact (event
+    messages and function-call outputs) are dropped so ``codex resume`` can
+    reconstruct the conversation without overflowing context.  Malformed rows
+    after the compact point are dropped, but they are never used as trim
     boundaries.
     """
     import shutil
@@ -1515,7 +1544,10 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     post_compact_anchor_lines = _codex_picker_anchor_lines(
         parsed, compact_idx + 1, min(len(parsed), compact_idx + 32)
     )
-    anchor_lines = post_compact_anchor_lines or pre_compact_anchor_lines
+    synthesized_anchor = None
+    if not post_compact_anchor_lines:
+        synthesized_anchor = _codex_tail_user_event(parsed, compact_idx + 1)
+    anchor_lines = post_compact_anchor_lines or ([] if synthesized_anchor else pre_compact_anchor_lines)
     post_compact_anchor_set = set(post_compact_anchor_lines)
 
     compact_entry = dict(parsed[compact_idx])
@@ -1554,6 +1586,7 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     if (valid_before_compact == header_lines
             and not invalid_retained_lines
             and not compact_rewrite_needed
+            and synthesized_anchor is None
             and not dropped_retained_lines):
         return False, before_size, before_size
 
@@ -1567,6 +1600,8 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
             line = lines[i]
             f.write(line if line.endswith(b"\n") else line + b"\n")
         f.write(json.dumps(compact_entry, ensure_ascii=False).encode() + b"\n")
+        if synthesized_anchor is not None:
+            f.write(json.dumps(synthesized_anchor, ensure_ascii=False).encode() + b"\n")
         for i in anchor_lines:
             line = lines[i]
             f.write(line if line.endswith(b"\n") else line + b"\n")

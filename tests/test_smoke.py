@@ -799,10 +799,10 @@ class TestCodexSupport:
         assert kept[1]["payload"]["replacement_history"] == [
             {"type": "compaction", "encrypted_content": "opaque-summary"}
         ]
-        assert kept[2]["payload"]["message"] == "old"
+        assert kept[2]["payload"]["message"] == "tail"
         assert kept[3]["payload"]["role"] == "assistant"
         assert kept[-1]["payload"]["content"] == "tail"
-        assert parse_codex_rollout(p)["first_user_message"] == "old"
+        assert parse_codex_rollout(p)["first_user_message"] == "tail"
         assert p.with_suffix(".jsonl.pretrim.bak").exists()
 
         trimmed_again, _, _ = trim_codex_at_last_compact(p)
