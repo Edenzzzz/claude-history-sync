@@ -773,54 +773,32 @@ def _codex_is_indexable_user_text(text: str) -> bool:
 
 
 def _codex_picker_anchor_lines(parsed: list[dict | None], start_idx: int, end_idx: int) -> list[int]:
-    """Return opening rows needed for Codex picker indexing.
+    """Return non-transcript rows needed for Codex picker indexing.
 
     Codex reconstructs resume context from the compacted row, but its session
     backfill derives title/first_user_message from the startup user-message
-    event after the compacted row.  Keeping only ``session_meta`` +
-    ``compacted`` resumes by UUID but makes the session disappear from the
-    picker.
+    event after the compacted row.  Do not retain the old user ``response_item``
+    as an anchor: that pollutes the resumed transcript and makes the TUI open
+    on the original prompt instead of the real post-compact tail.
     """
-    response_anchor_idx = None
-    event_anchor_idx = None
-    first_content_idx = None
-
     for i in range(start_idx, end_idx):
         entry = parsed[i]
         if entry is None or entry.get("type") == "session_meta":
             continue
-        if first_content_idx is None:
-            first_content_idx = i
 
         payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
         item = _codex_payload_item(entry)
-        if response_anchor_idx is None and item.get("type") in ("reasoning", "function_call", "function_call_output"):
+        if item.get("type") in ("reasoning", "function_call", "function_call_output"):
             break
-        if (response_anchor_idx is None
-                and item.get("type") == "message"
-                and item.get("role") == "assistant"):
+        if item.get("type") == "message" and item.get("role") == "assistant":
             break
 
         if entry.get("type") == "event_msg" and payload.get("type") == "user_message":
             message = payload.get("message")
             if isinstance(message, str) and _codex_is_indexable_user_text(message):
-                event_anchor_idx = i
-                break
+                return [i]
 
-        if (entry.get("type") == "response_item"
-                and item.get("type") == "message"
-                and item.get("role") == "user"):
-            text = _codex_message_text(item)
-            if _codex_is_indexable_user_text(text):
-                response_anchor_idx = i
-
-    anchor_idx = event_anchor_idx if event_anchor_idx is not None else response_anchor_idx
-    if anchor_idx is None or first_content_idx is None:
-        return []
-    return [
-        i for i in range(first_content_idx, anchor_idx + 1)
-        if parsed[i] is not None and parsed[i].get("type") != "session_meta"
-    ]
+    return []
 
 
 def _load_codex_session_index(codex_home: Path | None = None) -> dict:
