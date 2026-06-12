@@ -1374,12 +1374,17 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     return True, before_size, after_size
 
 
+CODEX_TAIL_BUDGET = 200 * 1024
+
+
 def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     """Trim a Codex rollout at the last ``type=compacted`` entry.
 
     Keeps the ``session_meta`` header, the last ``compacted`` entry (which
-    carries ``replacement_history`` — the surviving context), and every line
-    after it.  Everything before is discarded.
+    carries ``replacement_history`` — the surviving context), and trailing
+    entries up to ``CODEX_TAIL_BUDGET`` bytes.  Everything before the last
+    compaction is discarded, and the tail is capped so resume fits in the
+    model's context window.
 
     Returns ``(trimmed, before_bytes, after_bytes)``.
     """
@@ -1433,7 +1438,8 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     if compact_idx < 0:
         return False, before_size, before_size
 
-    # Already trimmed: compacted is right after header
+    # Check if any trimming is needed: either pre-compact entries to remove,
+    # or tail exceeds budget
     first_non_header = 0
     for i, line in enumerate(lines):
         stripped = line.strip()
@@ -1446,7 +1452,12 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
         if d.get("type") not in ("session_meta",):
             first_non_header = i
             break
-    if compact_idx == first_non_header:
+
+    tail_size = sum(len(lines[i]) for i in range(compact_idx + 1, len(lines))
+                    if lines[i].strip())
+    already_trimmed = compact_idx == first_non_header
+    tail_ok = tail_size <= CODEX_TAIL_BUDGET
+    if already_trimmed and tail_ok:
         return False, before_size, before_size
 
     bak = jsonl_path.with_suffix(jsonl_path.suffix + ".pretrim.bak")
@@ -1458,10 +1469,17 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
         for i in header_lines:
             line = lines[i]
             f.write(line if line.endswith("\n") else line + "\n")
-        for i in range(compact_idx, len(lines)):
+        f.write(lines[compact_idx] if lines[compact_idx].endswith("\n")
+                else lines[compact_idx] + "\n")
+        budget = CODEX_TAIL_BUDGET
+        for i in range(compact_idx + 1, len(lines)):
             stripped = lines[i].strip()
             if not stripped:
                 continue
+            line_len = len(lines[i])
+            if line_len > budget:
+                break
+            budget -= line_len
             f.write(lines[i] if lines[i].endswith("\n") else lines[i] + "\n")
 
     tmp.replace(jsonl_path)
