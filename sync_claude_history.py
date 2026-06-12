@@ -2533,7 +2533,7 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             should_push = (
                 not args.pull_only
                 and (local_mtime > remote_mtime
-                     or (local_mtime >= remote_mtime and fname in just_trimmed))
+                     or fname in just_trimmed)
             )
             if should_push:
                 if not args.dry_run:
