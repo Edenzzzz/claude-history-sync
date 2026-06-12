@@ -939,6 +939,166 @@ class TestCodexSupport:
             "updated_at": "2026-06-05T02:03:06Z",
         }]
 
+    def test_codex_sync_pushes_local_new_tail_over_newer_remote(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        repo = self._git_repo(tmp_path)
+        codex_home = tmp_path / ".codex"
+        rollout = self._codex_rollout(codex_home, repo, session_id="019e-local-tail")
+        with open(rollout, "a") as f:
+            f.write(json.dumps({
+                "timestamp": "2026-06-05T02:03:07Z",
+                "type": "response_item",
+                "payload": {
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "local latest tail"}],
+                    }
+                },
+            }) + "\n")
+        os.utime(rollout, (datetime(2026, 6, 5, 2, 3, 7, tzinfo=timezone.utc).timestamp(),) * 2)
+        monkeypatch.setattr(sync, "CODEX_HOME", codex_home)
+        monkeypatch.setattr(sync, "CLAUDE_PROJECTS_DIR", tmp_path / "empty-claude")
+        drive = self._patch_fake_drive(monkeypatch, sync)
+
+        raw_url = "git@github.com:org/repo.git"
+        url_key = sync.normalize_git_url(raw_url)
+        repo_folder_id = drive.get_or_create_folder(None, url_key, drive.root_id)
+        drive.folders[repo_folder_id]["description"] = raw_url
+        codex_folder_id = drive.get_or_create_folder(None, "src", repo_folder_id)
+        remote_name = f"_codex__{rollout.name}"
+        drive.put_file(
+            codex_folder_id,
+            remote_name,
+            json.dumps({
+                "timestamp": "2026-06-05T02:03:08Z",
+                "type": "session_meta",
+                "payload": {"id": "019e-local-tail", "cwd": str(repo / "src"), "git": {"repository_url": raw_url}},
+            }) + "\n",
+            modified_time="2026-06-05T02:03:08Z",
+        )
+
+        out = run_sync([], drive, drive.root_id)
+        check_format(out)
+        assert "codex 1 pushed, 0 pulled, 0 unchanged" in out
+        assert b"local latest tail" in drive.folders[codex_folder_id]["files"][remote_name]["content"]
+        assert "local latest tail" in rollout.read_text()
+
+    def test_codex_remote_only_path_respects_existing_local_timestamp(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        repo = self._git_repo(tmp_path)
+        codex_home = tmp_path / ".codex"
+        monkeypatch.setattr(sync, "CODEX_HOME", codex_home)
+        drive = self._patch_fake_drive(monkeypatch, sync)
+        folder_id = drive.get_or_create_folder(None, "src", drive.root_id)
+
+        fname = "rollout-2026-06-05T02-03-04-019e-remote-only.jsonl"
+        remote_name = f"_codex__{fname}"
+        local_path = codex_home / "sessions" / "2026" / "06" / "05" / fname
+        local_path.parent.mkdir(parents=True)
+        local_path.write_text(json.dumps({
+            "timestamp": "2026-06-05T02:03:10Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "019e-remote-only",
+                "cwd": str(repo / "src"),
+                "git": {"repository_url": "git@github.com:org/repo.git"},
+            },
+        }) + "\n" + json.dumps({
+            "timestamp": "2026-06-05T02:03:10Z",
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": "newer local tail"},
+        }) + "\n")
+        os.utime(local_path, (datetime(2026, 6, 5, 2, 3, 10, tzinfo=timezone.utc).timestamp(),) * 2)
+
+        drive.put_file(
+            folder_id,
+            remote_name,
+            json.dumps({
+                "timestamp": "2026-06-05T02:03:05Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "019e-remote-only",
+                    "cwd": "/old/repo/src",
+                    "git": {"repository_url": "git@github.com:org/repo.git"},
+                },
+            }) + "\n",
+            modified_time="2026-06-05T02:03:05Z",
+        )
+
+        pushed, pulled, skipped = sync.sync_codex_files(
+            drive,
+            folder_id,
+            [],
+            _parse_args([]),
+            git_root=str(repo),
+            rel_path="src",
+            remote_files=drive.list_remote_files(drive, folder_id),
+        )
+
+        assert (pushed, pulled, skipped) == (1, 0, 0)
+        assert "newer local tail" in local_path.read_text()
+        assert b"newer local tail" in drive.folders[folder_id]["files"][remote_name]["content"]
+
+    def test_codex_sync_pushes_valid_trim_even_when_remote_is_bigger(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        repo = self._git_repo(tmp_path)
+        codex_home = tmp_path / ".codex"
+        rollout = self._codex_rollout(codex_home, repo, session_id="019e-trimmed")
+        rollout.write_text(json.dumps({
+            "timestamp": "2026-06-05T02:03:07Z",
+            "type": "session_meta",
+            "payload": {"id": "019e-trimmed", "cwd": str(repo / "src"), "git": {"repository_url": "git@github.com:org/repo.git"}},
+        }) + "\n" + json.dumps({
+            "timestamp": "2026-06-05T02:03:07Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "trimmed tail", "images": [], "local_images": [], "text_elements": []},
+        }) + "\n" + json.dumps({
+            "timestamp": "2026-06-05T02:03:07Z",
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user", "content": "trimmed tail"},
+        }) + "\n")
+        rollout.with_suffix(rollout.suffix + ".pretrim.bak").write_text("large original backup\n")
+        os.utime(rollout, (datetime(2026, 6, 5, 2, 3, 7, tzinfo=timezone.utc).timestamp(),) * 2)
+        monkeypatch.setattr(sync, "CODEX_HOME", codex_home)
+        monkeypatch.setattr(sync, "CLAUDE_PROJECTS_DIR", tmp_path / "empty-claude")
+        drive = self._patch_fake_drive(monkeypatch, sync)
+
+        raw_url = "git@github.com:org/repo.git"
+        url_key = sync.normalize_git_url(raw_url)
+        repo_folder_id = drive.get_or_create_folder(None, url_key, drive.root_id)
+        drive.folders[repo_folder_id]["description"] = raw_url
+        codex_folder_id = drive.get_or_create_folder(None, "src", repo_folder_id)
+        remote_name = f"_codex__{rollout.name}"
+        remote_rows = [
+            {
+                "timestamp": "2026-06-05T02:03:08Z",
+                "type": "session_meta",
+                "payload": {"id": "019e-trimmed", "cwd": str(repo / "src"), "git": {"repository_url": raw_url}},
+            },
+            {
+                "timestamp": "2026-06-05T02:03:08Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": "remote stale " + ("x" * 1000)},
+            },
+        ]
+        drive.put_file(
+            codex_folder_id,
+            remote_name,
+            "".join(json.dumps(row) + "\n" for row in remote_rows),
+            modified_time="2026-06-05T02:03:08Z",
+        )
+
+        out = run_sync([], drive, drive.root_id)
+        check_format(out)
+        assert "codex 1 pushed, 0 pulled, 0 unchanged" in out
+        remote_content = drive.folders[codex_folder_id]["files"][remote_name]["content"].decode()
+        assert "trimmed tail" in remote_content
+        assert "remote stale" not in rollout.read_text()
+
     def test_claude_pull_rewrites_cwd_from_drive_rel_path(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
 

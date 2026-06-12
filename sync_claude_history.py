@@ -2686,16 +2686,47 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                 remote["modifiedTime"].replace("Z", "+00:00")
             ).timestamp()
             remote_size = int(remote.get("size", 0))
+            has_pretrim_bak = local_path.with_suffix(
+                local_path.suffix + ".pretrim.bak").exists()
+            local_is_valid_trim = fname in just_trimmed or has_pretrim_bak
+            local_is_newer = local_mtime > remote_mtime
+            remote_is_newer = remote_mtime > local_mtime
+            local_likely_has_new_tail = (
+                remote_size > 0 and local_size > remote_size * 1.05
+            )
+            local_likely_corrupt_shrink = (
+                remote_size > 0 and local_size <= remote_size * 0.95
+                and not local_is_valid_trim
+            )
             should_push = (
                 not args.pull_only
-                and (local_mtime > remote_mtime
-                     or fname in just_trimmed)
+                and (
+                    local_is_newer
+                    or local_is_valid_trim
+                    or (remote_is_newer and local_likely_has_new_tail)
+                )
+                and not (local_is_newer and local_likely_corrupt_shrink)
             )
             if should_push:
                 if not args.dry_run:
                     media = MediaFileUpload(str(local_path))
                     service.files().update(fileId=remote["id"], media_body=media).execute()
                 pushed += 1
+            elif local_is_newer and local_likely_corrupt_shrink and not args.pull_only:
+                if not args.dry_run:
+                    download_file(service, remote["id"], local_path)
+                    trim_codex_at_last_compact(local_path)
+                    if local_cwd:
+                        rewrite_codex_cwd_if_needed(local_path, local_cwd)
+                    pulled_meta = parse_codex_rollout(local_path)
+                    pulled_sid = pulled_meta.get("session_id") or entry.get("session_id") or ""
+                    pulled_meta.update({
+                        "path": local_path,
+                        "title": codex_titles.get(pulled_sid) or entry.get("title"),
+                        "session_id": pulled_sid,
+                    })
+                    pulled_entries.append(pulled_meta)
+                pulled += 1
             elif remote_mtime > local_mtime and not args.push_only:
                 if not args.dry_run:
                     download_file(service, remote["id"], local_path)
@@ -2738,6 +2769,36 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             remote_mtime = datetime.fromisoformat(
                 remote["modifiedTime"].replace("Z", "+00:00")
             ).timestamp()
+            if local_path.exists():
+                local_md5 = local_file_md5(local_path)
+                if local_md5 == remote.get("md5Checksum", ""):
+                    skipped += 1
+                    continue
+
+                local_mtime = local_path.stat().st_mtime
+                local_size = local_path.stat().st_size
+                has_pretrim_bak = local_path.with_suffix(
+                    local_path.suffix + ".pretrim.bak").exists()
+                local_is_valid_trim = has_pretrim_bak
+                local_is_newer = local_mtime > remote_mtime
+                remote_is_newer = remote_mtime > local_mtime
+                local_likely_has_new_tail = (
+                    remote_size > 0 and local_size > remote_size * 1.05
+                )
+                if (not args.pull_only
+                        and (local_is_newer
+                             or local_is_valid_trim
+                             or (remote_is_newer and local_likely_has_new_tail))):
+                    if not args.dry_run:
+                        media = MediaFileUpload(str(local_path))
+                        service.files().update(fileId=remote["id"], media_body=media).execute()
+                    pushed += 1
+                    continue
+
+                if not remote_is_newer or args.push_only:
+                    skipped += 1
+                    continue
+
             if not args.dry_run:
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 download_file(service, remote["id"], local_path)
