@@ -772,19 +772,20 @@ def _codex_is_indexable_user_text(text: str) -> bool:
     return not text.startswith(internal_prefixes)
 
 
-def _codex_picker_anchor_lines(parsed: list[dict | None], compact_idx: int) -> list[int]:
-    """Return pre-compact opening rows needed for Codex picker indexing.
+def _codex_picker_anchor_lines(parsed: list[dict | None], start_idx: int, end_idx: int) -> list[int]:
+    """Return opening rows needed for Codex picker indexing.
 
     Codex reconstructs resume context from the compacted row, but its session
     backfill derives title/first_user_message from the startup user-message
-    event.  Keeping only ``session_meta`` + ``compacted`` resumes by UUID but
-    makes the session disappear from the picker.
+    event after the compacted row.  Keeping only ``session_meta`` +
+    ``compacted`` resumes by UUID but makes the session disappear from the
+    picker.
     """
     response_anchor_idx = None
     event_anchor_idx = None
     first_content_idx = None
 
-    for i in range(compact_idx):
+    for i in range(start_idx, end_idx):
         entry = parsed[i]
         if entry is None or entry.get("type") == "session_meta":
             continue
@@ -792,13 +793,20 @@ def _codex_picker_anchor_lines(parsed: list[dict | None], compact_idx: int) -> l
             first_content_idx = i
 
         payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+        item = _codex_payload_item(entry)
+        if response_anchor_idx is None and item.get("type") in ("reasoning", "function_call", "function_call_output"):
+            break
+        if (response_anchor_idx is None
+                and item.get("type") == "message"
+                and item.get("role") == "assistant"):
+            break
+
         if entry.get("type") == "event_msg" and payload.get("type") == "user_message":
             message = payload.get("message")
             if isinstance(message, str) and _codex_is_indexable_user_text(message):
                 event_anchor_idx = i
                 break
 
-        item = _codex_payload_item(entry)
         if (entry.get("type") == "response_item"
                 and item.get("type") == "message"
                 and item.get("role") == "user"):
@@ -1525,11 +1533,12 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
         if lines[i].strip() and parsed[i] is None
     ]
     header_lines = [i for i in header_lines if i < compact_idx]
-    anchor_lines = _codex_picker_anchor_lines(parsed, compact_idx)
-    prefix_lines = header_lines + [
-        i for i in anchor_lines
-        if i not in set(header_lines)
-    ]
+    pre_compact_anchor_lines = _codex_picker_anchor_lines(parsed, 0, compact_idx)
+    post_compact_anchor_lines = _codex_picker_anchor_lines(
+        parsed, compact_idx + 1, min(len(parsed), compact_idx + 32)
+    )
+    anchor_lines = post_compact_anchor_lines or pre_compact_anchor_lines
+    post_compact_anchor_set = set(post_compact_anchor_lines)
 
     compact_entry = dict(parsed[compact_idx])
     payload = compact_entry.get("payload")
@@ -1551,6 +1560,8 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     for i in range(compact_idx + 1, len(lines)):
         if not lines[i].strip() or parsed[i] is None:
             continue
+        if i in post_compact_anchor_set:
+            continue
         d = parsed[i]
         payload = d.get("payload") if isinstance(d.get("payload"), dict) else {}
         if d.get("type") == "event_msg":
@@ -1562,7 +1573,7 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
         i for i in range(compact_idx)
         if lines[i].strip() and parsed[i] is not None
     ]
-    if (valid_before_compact == prefix_lines
+    if (valid_before_compact == header_lines
             and not invalid_retained_lines
             and not compact_rewrite_needed
             and not dropped_retained_lines):
@@ -1574,16 +1585,19 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
 
     tmp = jsonl_path.with_suffix(jsonl_path.suffix + ".trim.tmp")
     with open(tmp, "wb") as f:
-        for i in prefix_lines:
+        for i in header_lines:
             line = lines[i]
             f.write(line if line.endswith(b"\n") else line + b"\n")
-        for i in range(compact_idx, len(lines)):
+        f.write(json.dumps(compact_entry, ensure_ascii=False).encode() + b"\n")
+        for i in anchor_lines:
+            line = lines[i]
+            f.write(line if line.endswith(b"\n") else line + b"\n")
+        for i in range(compact_idx + 1, len(lines)):
             if not lines[i].strip() or parsed[i] is None:
                 continue
-            d = parsed[i]
-            if i == compact_idx:
-                f.write(json.dumps(compact_entry, ensure_ascii=False).encode() + b"\n")
+            if i in post_compact_anchor_set:
                 continue
+            d = parsed[i]
             if d.get("type") == "event_msg":
                 continue
             payload = d.get("payload") if isinstance(d.get("payload"), dict) else {}

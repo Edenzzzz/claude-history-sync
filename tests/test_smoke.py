@@ -794,16 +794,20 @@ class TestCodexSupport:
 
         kept = [json.loads(line) for line in p.read_bytes().splitlines()]
         assert [row["type"] for row in kept] == [
-            "session_meta", "turn_context", "response_item", "response_item",
-            "event_msg", "compacted", "response_item", "response_item"
+            "session_meta", "compacted", "turn_context", "response_item",
+            "response_item", "event_msg", "response_item", "response_item"
         ]
-        assert kept[4]["payload"]["message"] == "old"
-        assert kept[5]["payload"]["replacement_history"] == [
+        assert kept[1]["payload"]["replacement_history"] == [
             {"type": "compaction", "encrypted_content": "opaque-summary"}
         ]
+        assert kept[5]["payload"]["message"] == "old"
         assert kept[-1]["payload"]["content"] == "tail"
         assert parse_codex_rollout(p)["first_user_message"] == "old"
         assert p.with_suffix(".jsonl.pretrim.bak").exists()
+
+        trimmed_again, _, _ = trim_codex_at_last_compact(p)
+        assert trimmed_again is False
+        assert [json.loads(line) for line in p.read_bytes().splitlines()] == kept
 
     def test_board_shows_claude_and_codex_prefixes(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
