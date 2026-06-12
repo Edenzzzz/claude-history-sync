@@ -569,16 +569,33 @@ def is_jsonl_conversation_file(fname: str) -> bool:
     return fname.endswith(".jsonl") and not is_codex_remote_file(fname)
 
 
-def codex_name_matches_chat_filters(fname: str, chat_filters: list[str] | None) -> bool:
+def codex_group_slug(title: str | None) -> str:
+    """Create a short lowercase slug from a codex rollout title for grouping."""
+    if not title:
+        return "_untitled"
+    t = title.strip()
+    if t.startswith("#"):
+        t = t.lstrip("# ").split("\n")[0]
+    t = t.split("\n")[0][:80]
+    slug = re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")
+    return slug[:60] or "_untitled"
+
+
+def codex_name_matches_chat_filters(fname: str, chat_filters: list[str] | None,
+                                     title: str | None = None) -> bool:
     if not chat_filters:
         return True
     local_name = codex_local_name_from_remote(fname)
     stem = local_name[:-6] if local_name.endswith(".jsonl") else local_name
+    slug = codex_group_slug(title) if title else ""
+    title_lower = (title or "").lower()
     return any(
         local_name.startswith(c)
         or stem.startswith(c)
         or stem.endswith(c)
         or f"-{c}" in stem
+        or (slug and c.lower() in slug)
+        or (title_lower and c.lower() in title_lower)
         for c in chat_filters
     )
 
@@ -2291,9 +2308,8 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
     by_name = {}
     for entry in entries:
         fname = entry["path"].name
-        if chat_filters and not any(
-            entry.get("session_id", "").startswith(c) or fname.startswith(c)
-            for c in chat_filters
+        if chat_filters and not codex_name_matches_chat_filters(
+            fname, chat_filters, title=entry.get("title")
         ):
             continue
         by_name[fname] = entry
@@ -2323,14 +2339,11 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             ).timestamp()
             remote_size = int(remote.get("size", 0))
             if local_mtime > remote_mtime and not args.pull_only:
-                action = "WOULD PUSH" if args.dry_run else "PUSHED"
                 if not args.dry_run:
                     media = MediaFileUpload(str(local_path))
                     service.files().update(fileId=remote["id"], media_body=media).execute()
-                print(f"{indent}[codex {action}] {remote_name} ({format_size(local_size)}, {format_time(local_mtime)})")
                 pushed += 1
             elif remote_mtime > local_mtime and not args.push_only:
-                action = "WOULD PULL" if args.dry_run else "PULLED"
                 if not args.dry_run:
                     download_file(service, remote["id"], local_path)
                     if local_cwd:
@@ -2342,12 +2355,10 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                         "session_id": pulled_meta.get("session_id") or entry.get("session_id"),
                     })
                     pulled_entries.append(pulled_meta)
-                print(f"{indent}[codex {action}] {remote_name} ({format_size(remote_size)}, {format_time(remote_mtime)})")
                 pulled += 1
             else:
                 skipped += 1
         elif not args.pull_only:
-            action = "WOULD PUSH NEW" if args.dry_run else "PUSHED NEW"
             remote_name = codex_remote_name_from_local(fname) if require_remote_prefix else fname
             if not args.dry_run:
                 media = MediaFileUpload(str(local_path))
@@ -2355,7 +2366,6 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                     body={"name": remote_name, "parents": [folder_id]},
                     media_body=media,
                 ).execute()
-            print(f"{indent}[codex {action}] {remote_name} ({format_size(local_size)}, {format_time(local_mtime)})")
             pushed += 1
 
     if not args.push_only:
@@ -2369,7 +2379,6 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             remote_mtime = datetime.fromisoformat(
                 remote["modifiedTime"].replace("Z", "+00:00")
             ).timestamp()
-            action = "WOULD PULL NEW" if args.dry_run else "PULLED NEW"
             if not args.dry_run:
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 download_file(service, remote["id"], local_path)
@@ -2378,7 +2387,6 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                 pulled_meta = parse_codex_rollout(local_path)
                 pulled_meta.update({"path": local_path})
                 pulled_entries.append(pulled_meta)
-            print(f"{indent}[codex {action}] {remote_name} ({format_size(remote_size)}, {format_time(remote_mtime)})")
             pulled += 1
 
     if not args.dry_run:
@@ -2428,28 +2436,41 @@ def sync_codex_push(service, root_folder_id, codex_git_projects: dict, args) -> 
             print(f"  ║   ╰─> {git_root}")
         print(f"  ║ ----------------------------------------------------------------------")
 
+        chat_ids = getattr(args, "chat_id", None)
+        chat_filters = [c.strip() for c in chat_ids.split(",")] if chat_ids else None
+
         for rel_path, rel_entries in sorted(by_rel.items()):
             sf_name = codex_rel_path_to_drive_subfolder(rel_path)
             subfolder_id = existing_subs.get(sf_name)
             if not subfolder_id:
                 subfolder_id = get_or_create_folder(service, sf_name, repo_folder_id)
             remote_sub_files = list_remote_files(service, subfolder_id)
-            local_count = len(rel_entries)
-            local_size = sum(e["path"].stat().st_size for e in rel_entries)
+            filtered_entries = [
+                e for e in rel_entries
+                if not chat_filters or codex_name_matches_chat_filters(
+                    e["path"].name, chat_filters, title=e.get("title")
+                )
+            ]
+            local_count = len(filtered_entries)
+            local_size = sum(e["path"].stat().st_size for e in filtered_entries)
             remote_count = sum(1 for k in remote_sub_files if is_codex_remote_file(k))
             remote_size = sum(
                 int(f.get("size", 0)) for k, f in remote_sub_files.items()
                 if is_codex_remote_file(k)
             )
+            if not local_count and not remote_count:
+                continue
             label = "." if rel_path == "." else rel_path
             print(f"  ║ [codex] {label:<27s} {local_count:>2} local ({format_size(local_size):>8})  {remote_count:>2} remote ({format_size(remote_size):>8})")
-            if args.verbose:
-                for entry in sorted(rel_entries, key=lambda e: e["path"].name):
-                    title = entry.get("title") or "(untitled)"
-                    size = format_size(entry["path"].stat().st_size)
-                    mtime = format_time(entry["path"].stat().st_mtime)
-                    sid = entry.get("session_id") or entry["path"].stem
-                    print(f"  ║   ╰─ [codex] {sid[:8]}...  \"{title[:30]:<30s}\" {size:>8}  {mtime}")
+            groups = {}
+            for entry in filtered_entries:
+                slug = codex_group_slug(entry.get("title"))
+                groups.setdefault(slug, []).append(entry)
+            for slug, group_entries in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+                g_size = sum(e["path"].stat().st_size for e in group_entries)
+                g_title = group_entries[0].get("title") or "(untitled)"
+                g_title_short = g_title.strip().split("\n")[0][:40]
+                print(f"  ║   ╰─ [codex group] \"{g_title_short}\" ({len(group_entries)} rollouts, {format_size(g_size)})")
             pushed, pulled, skipped = sync_codex_files(
                 service, subfolder_id, rel_entries, args,
                 git_root=rel_entries[0].get("git_root"),
@@ -2497,6 +2518,7 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
             )
 
         codex_records = []
+        seen_rel_paths = set()
         for subfolder_name, subfolder_id in sorted(remote_subfolders.items()):
             legacy_codex_folder = is_codex_drive_subfolder(subfolder_name)
             rel_path = (
@@ -2517,8 +2539,9 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
                     k: v for k, v in remote_sub_files.items()
                     if is_codex_remote_file(k)
                 }
-            entries = local_by_url.get(url_key, {}).get(rel_path, [])
+            entries = local_by_url.get(url_key, {}).get(rel_path, []) if rel_path not in seen_rel_paths else []
             if codex_remote_files or entries:
+                seen_rel_paths.add(rel_path)
                 codex_records.append((
                     subfolder_id,
                     legacy_codex_folder,
@@ -2527,32 +2550,31 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
                     codex_remote_files,
                     entries,
                 ))
-        if not codex_records:
+        has_any_remote = any(rec[4] for rec in codex_records)
+        if not codex_records or not has_any_remote:
             continue
 
         B = "  ╠═══════════════════════════════════════════════════════════════════════════"
-        if not printed_any:
-            print(B)
-            printed_any = True
+
         if not git_root:
+            if not printed_any:
+                print(B)
+                printed_any = True
             print(f"  ║ [codex] {raw_url}  (no local clone)")
             print(f"  ║ ----------------------------------------------------------------------")
             print(B)
             continue
-        print(f"  ║ [codex] {raw_url}")
-        print(f"  ║   ╰─> {git_root}")
-        print(f"  ║ ----------------------------------------------------------------------")
 
+        chat_ids = getattr(args, "chat_id", None)
+        chat_filters = [c.strip() for c in chat_ids.split(",")] if chat_ids else None
+
+        any_activity = False
+        record_results = []
         for (subfolder_id, legacy_codex_folder, rel_path, remote_sub_files,
              codex_remote_files, entries) in codex_records:
             remote_count = len(codex_remote_files)
-            remote_size = sum(
-                int(f.get("size", 0)) for f in codex_remote_files.values()
-            )
-            local_count = len(entries)
-            local_size = sum(e["path"].stat().st_size for e in entries)
-            label = "." if rel_path == "." else rel_path
-            print(f"  ║ [codex] {label:<27s} {local_count:>2} local ({format_size(local_size):>8})  {remote_count:>2} remote ({format_size(remote_size):>8})")
+            if not remote_count and not entries:
+                continue
             pushed, pulled, skipped = sync_codex_files(
                 service, subfolder_id, entries, args,
                 git_root=git_root,
@@ -2561,6 +2583,45 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
                 remote_files=remote_sub_files,
                 require_remote_prefix=not legacy_codex_folder,
             )
+            if pushed or pulled or remote_count:
+                any_activity = True
+            record_results.append((rel_path, entries, codex_remote_files, pushed, pulled, skipped))
+
+        if not any_activity:
+            continue
+
+        if not printed_any:
+            print(B)
+            printed_any = True
+        print(f"  ║ [codex] {raw_url}")
+        print(f"  ║   ╰─> {git_root}")
+        print(f"  ║ ----------------------------------------------------------------------")
+
+        for (rel_path, entries, codex_remote_files, pushed, pulled, skipped) in record_results:
+            remote_count = len(codex_remote_files)
+            remote_size = sum(int(f.get("size", 0)) for f in codex_remote_files.values())
+            filtered_entries = [
+                e for e in entries
+                if not chat_filters or codex_name_matches_chat_filters(
+                    e["path"].name, chat_filters, title=e.get("title")
+                )
+            ]
+            local_count = len(filtered_entries)
+            local_size = sum(e["path"].stat().st_size for e in filtered_entries)
+            if not local_count and not remote_count:
+                continue
+            label = "." if rel_path == "." else rel_path
+            print(f"  ║ [codex] {label:<27s} {local_count:>2} local ({format_size(local_size):>8})  {remote_count:>2} remote ({format_size(remote_size):>8})")
+            if filtered_entries:
+                groups = {}
+                for entry in filtered_entries:
+                    slug = codex_group_slug(entry.get("title"))
+                    groups.setdefault(slug, []).append(entry)
+                for slug, group_entries in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+                    g_size = sum(e["path"].stat().st_size for e in group_entries)
+                    g_title = group_entries[0].get("title") or "(untitled)"
+                    g_title_short = g_title.strip().split("\n")[0][:40]
+                    print(f"  ║   ╰─ [codex group] \"{g_title_short}\" ({len(group_entries)} rollouts, {format_size(g_size)})")
             if pushed or pulled:
                 if args.dry_run:
                     print(f"  ║   => codex would push {pushed}, would pull {pulled}, {skipped} unchanged")
@@ -2711,10 +2772,6 @@ def run_sync(args, service, root_folder_id):
           f"{len(no_git)} without; "
           f"{sum(len(v) for v in codex_git_projects.values())} Codex conversations with git remotes, "
           f"{len(codex_no_git)} Codex without")
-    for d, _, _, _ in no_git:
-        print(f"  [SKIP no git] {d.name}")
-    for entry in codex_no_git:
-        print(f"  [SKIP codex no git] {entry['path'].name}")
 
     # --- DELETE LOCAL: remove local conversation files ---
     if args.delete and args.local:
@@ -2897,13 +2954,8 @@ def run_sync(args, service, root_folder_id):
                 )
 
             B = "  ╠═══════════════════════════════════════════════════════════════════════════"
-            if not push_printed_any:
-                print(B)
-                push_printed_any = True
             git_root = entries[0][2]
-            print(f"  ║ {raw_url}")
-            print(f"  ║   ╰─> {git_root}")
-            print(f"  ║ ----------------------------------------------------------------------")
+            repo_header_printed = False
             for project_dir, _, _, rel_path in entries:
                 subfolder_name = rel_path_to_drive_subfolder(rel_path)
                 subfolder_id = sf_ids[(url_key, subfolder_name)]
@@ -2920,6 +2972,16 @@ def run_sync(args, service, root_folder_id):
                 )
 
                 subdir_label = "." if rel_path == "." else rel_path
+                if not local_count and not remote_count:
+                    continue
+                if not repo_header_printed:
+                    if not push_printed_any:
+                        print(B)
+                        push_printed_any = True
+                    print(f"  ║ {raw_url}")
+                    print(f"  ║   ╰─> {git_root}")
+                    print(f"  ║ ----------------------------------------------------------------------")
+                    repo_header_printed = True
                 print(f"  ║ {subdir_label:<35s} {local_count:>2} local ({format_size(local_size):>8})  {remote_count:>2} remote ({format_size(remote_size):>8})")
 
                 if args.verbose:
@@ -2946,7 +3008,8 @@ def run_sync(args, service, root_folder_id):
                         print(f"  ║   => would push {pushed}, would pull {pulled}, {skipped} unchanged")
                     else:
                         print(f"  ║   => {pushed} pushed, {pulled} pulled, {skipped} unchanged")
-            print(B)
+            if repo_header_printed:
+                print(B)
 
         push_printed_any = sync_codex_push(
             service, root_folder_id, codex_git_projects, args
@@ -3073,13 +3136,7 @@ def run_sync(args, service, root_folder_id):
             for rp, (pd, gr) in local_map.items():
                 pull_git_root = gr
                 break
-            if not pull_printed_first:
-                print(B)
-                pull_printed_first = True
-            print(f"  ║ {raw_url}")
-            if pull_git_root:
-                print(f"  ║   ╰─> {pull_git_root}")
-            print(f"  ║ ----------------------------------------------------------------------")
+            repo_header_printed = False
             chat_filters = [c.strip() for c in args.chat_id.split(",")] if getattr(args, "chat_id", None) else None
             for subfolder_name, subfolder_id in remote_subfolders.items():
                 if is_codex_drive_subfolder(subfolder_name):
@@ -3112,6 +3169,17 @@ def run_sync(args, service, root_folder_id):
                     local_count = len(local_jsons)
                     local_size = sum(p.stat().st_size for p in local_jsons.values())
 
+                    if not local_count and not remote_count:
+                        continue
+                    if not repo_header_printed:
+                        if not pull_printed_first:
+                            print(B)
+                            pull_printed_first = True
+                        print(f"  ║ {raw_url}")
+                        if pull_git_root:
+                            print(f"  ║   ╰─> {pull_git_root}")
+                        print(f"  ║ ----------------------------------------------------------------------")
+                        repo_header_printed = True
                     print(f"  ║ {subdir_label:<35s} {local_count:>2} local ({format_size(local_size):>8})  {remote_count:>2} remote ({format_size(remote_size):>8})")
 
                     if args.verbose:
@@ -3155,6 +3223,15 @@ def run_sync(args, service, root_folder_id):
                         local_jsons = {}
                         local_count = 0
                         local_size = 0
+                        if not repo_header_printed:
+                            if not pull_printed_first:
+                                print(B)
+                                pull_printed_first = True
+                            print(f"  ║ {raw_url}")
+                            if pull_git_root:
+                                print(f"  ║   ╰─> {pull_git_root}")
+                            print(f"  ║ ----------------------------------------------------------------------")
+                            repo_header_printed = True
                         print(f"  ║ {subdir_label:<35s} {local_count:>2} local ({format_size(local_size):>8})  {remote_count:>2} remote ({format_size(remote_size):>8})  (created)")
 
                         pushed, pulled, skipped = sync_files(
@@ -3172,8 +3249,18 @@ def run_sync(args, service, root_folder_id):
                             else:
                                 print(f"  ║   => {pushed} pushed, {pulled} pulled, {skipped} unchanged")
                     elif remote_count > 0:
+                        if not repo_header_printed:
+                            if not pull_printed_first:
+                                print(B)
+                                pull_printed_first = True
+                            print(f"  ║ {raw_url}")
+                            if pull_git_root:
+                                print(f"  ║   ╰─> {pull_git_root}")
+                            print(f"  ║ ----------------------------------------------------------------------")
+                            repo_header_printed = True
                         print(f"  ║ {subdir_label:<35s} {'--':>17}  {remote_count:>2} remote ({format_size(remote_size):>8})")
-            print(B)
+            if repo_header_printed:
+                print(B)
 
         sync_codex_pull(
             service, root_folder_id, codex_git_projects, args,

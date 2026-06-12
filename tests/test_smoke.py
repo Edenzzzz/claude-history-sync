@@ -730,7 +730,8 @@ class TestCodexSupport:
         out = run_sync(["--push"], drive, drive.root_id)
         check_format(out)
         assert "[codex] git@github.com:org/repo.git" in out
-        assert "[codex PUSHED NEW]" in out
+        assert "codex 1 pushed, 0 pulled, 0 unchanged" in out
+        assert '[codex group] "first prompt"' in out
 
         url_key = sync.normalize_git_url("git@github.com:org/repo.git")
         repo_folder_id = drive.folders[drive.root_id]["folders"][url_key]
@@ -795,7 +796,7 @@ class TestCodexSupport:
 
         out = run_sync(["--pull"], drive, drive.root_id)
         check_format(out)
-        assert "[codex PULLED NEW]" in out
+        assert "codex 0 pushed, 1 pulled, 0 unchanged" in out
 
         local_path = codex_home / "sessions" / "2026" / "06" / "05" / fname
         pulled = [json.loads(line) for line in local_path.read_text().splitlines()]
@@ -857,7 +858,7 @@ class TestCodexSupport:
 
         out = run_sync(["--pull"], drive, drive.root_id)
         check_format(out)
-        assert "[codex PULLED NEW]" in out
+        assert "codex 0 pushed, 1 pulled, 0 unchanged" in out
         local_path = codex_home / "sessions" / "2026" / "06" / "05" / fname
         assert local_path.exists()
         pulled = [json.loads(line) for line in local_path.read_text().splitlines()]
