@@ -44,6 +44,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+import google_auth_httplib2
+import httplib2
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -53,6 +55,15 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 GOOGLE_API_HOSTS = ["oauth2.googleapis.com", "www.googleapis.com"]
+
+
+def _configured_proxy_url():
+    return (
+        os.environ.get("https_proxy")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("http_proxy")
+        or os.environ.get("HTTP_PROXY")
+    )
 
 
 def _check_reachable(host, port=443, timeout=3):
@@ -83,6 +94,9 @@ def _resolve_via_doh(hostname):
 def patch_dns_if_needed():
     """If googleapis.com is unreachable via local DNS, resolve via DoH and
     monkey-patch socket.getaddrinfo to use the public IPs as a fallback."""
+    if _configured_proxy_url():
+        return
+
     if _check_reachable(GOOGLE_API_HOSTS[0]):
         return
 
@@ -152,6 +166,17 @@ CODEX_DRIVE_PREFIX = "_codex__"
 # Google Drive helpers
 # ---------------------------------------------------------------------------
 
+def _build_drive_service(creds):
+    """Build a Drive service with an explicit httplib2 proxy when configured."""
+    proxy_url = _configured_proxy_url()
+    http = httplib2.Http(
+        timeout=60,
+        proxy_info=httplib2.proxy_info_from_url(proxy_url, "https") if proxy_url else None,
+    )
+    authed_http = google_auth_httplib2.AuthorizedHttp(creds, http=http)
+    return build("drive", "v3", http=authed_http)
+
+
 def get_drive_service():
     """Authenticate with Google Drive.
 
@@ -163,7 +188,7 @@ def get_drive_service():
         creds = service_account.Credentials.from_service_account_file(
             str(SERVICE_ACCOUNT_PATH), scopes=SCOPES
         )
-        return build("drive", "v3", credentials=creds)
+        return _build_drive_service(creds)
 
     # Option 2: OAuth (needs browser on first run per machine)
     creds = None
@@ -199,7 +224,7 @@ def get_drive_service():
                 flow.fetch_token(code=code)
                 creds = flow.credentials
         TOKEN_PATH.write_text(creds.to_json())
-    return build("drive", "v3", credentials=creds)
+    return _build_drive_service(creds)
 
 
 def get_or_create_folder(service, folder_name, parent_id=None):

@@ -32,6 +32,50 @@ def drive():
     return service, root_id
 
 
+def test_configured_proxy_url_prefers_https(monkeypatch):
+    import sync_claude_history as sync
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://http-proxy.example:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://https-proxy.example:3128")
+
+    assert sync._configured_proxy_url() == "http://https-proxy.example:3128"
+
+
+def test_patch_dns_skips_direct_probe_when_proxy_configured(monkeypatch):
+    import sync_claude_history as sync
+    monkeypatch.setenv("HTTPS_PROXY", "http://localhost:9090")
+
+    def fail_probe(*args, **kwargs):
+        raise AssertionError("direct reachability probe should be skipped")
+
+    monkeypatch.setattr(sync, "_check_reachable", fail_probe)
+    sync.patch_dns_if_needed()
+
+
+def test_build_drive_service_uses_proxy(monkeypatch):
+    import sync_claude_history as sync
+
+    captured = {}
+
+    class DummyAuthorizedHttp:
+        def __init__(self, creds, http):
+            captured["creds"] = creds
+            captured["http"] = http
+
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://localhost:9090")
+    monkeypatch.setattr(sync.google_auth_httplib2, "AuthorizedHttp", DummyAuthorizedHttp)
+    monkeypatch.setattr(sync, "build", lambda *args, **kwargs: (args, kwargs))
+
+    service = sync._build_drive_service(creds=object())
+
+    assert service[0] == ("drive", "v3")
+    assert captured["http"].proxy_info.proxy_host == "localhost"
+    assert captured["http"].proxy_info.proxy_port == 9090
+
+
 def _parse_args(args_list):
     import argparse
     parser = argparse.ArgumentParser()
