@@ -582,13 +582,15 @@ def codex_group_slug(title: str | None) -> str:
 
 
 def codex_name_matches_chat_filters(fname: str, chat_filters: list[str] | None,
-                                     title: str | None = None) -> bool:
+                                     title: str | None = None,
+                                     session_id: str | None = None) -> bool:
     if not chat_filters:
         return True
     local_name = codex_local_name_from_remote(fname)
     stem = local_name[:-6] if local_name.endswith(".jsonl") else local_name
     slug = codex_group_slug(title) if title else ""
     title_lower = (title or "").lower()
+    sid = session_id or ""
     return any(
         local_name.startswith(c)
         or stem.startswith(c)
@@ -596,6 +598,7 @@ def codex_name_matches_chat_filters(fname: str, chat_filters: list[str] | None,
         or f"-{c}" in stem
         or (slug and c.lower() in slug)
         or (title_lower and c.lower() in title_lower)
+        or (sid and sid.startswith(c))
         for c in chat_filters
     )
 
@@ -861,9 +864,13 @@ def build_codex_index(codex_home: Path | None = None) -> dict:
             continue
 
         title_info = session_titles.get(session_id, {})
+        thread_name = title_info.get("thread_name")
+        sqlite_title = row.get("title")
+        if sqlite_title and len(sqlite_title) > 120:
+            sqlite_title = None
         title = (
-            row.get("title")
-            or title_info.get("thread_name")
+            thread_name
+            or sqlite_title
             or parsed.get("first_user_message")
             or row.get("first_user_message")
         )
@@ -907,9 +914,13 @@ def upsert_codex_session_index(entries: list[dict], codex_home: Path | None = No
             else datetime.now(timezone.utc)
         )
         updated_iso = updated_dt.replace(tzinfo=None).isoformat() + "Z"
+        new_name = entry.get("title") or entry.get("first_user_message")
+        existing_name = by_id.get(sid, {}).get("thread_name")
+        if existing_name and existing_name != sid and not new_name:
+            new_name = existing_name
         by_id[sid] = {
             "id": sid,
-            "thread_name": entry.get("title") or entry.get("first_user_message") or sid,
+            "thread_name": new_name or sid,
             "updated_at": updated_iso,
         }
     seen = set()
@@ -1772,6 +1783,21 @@ def resolve_chat_id(prefix: str) -> tuple[str, str | None]:
                 size = 0
             matches.append((f.stem, project_dir, size))
     if not matches:
+        codex_threads = _load_codex_sqlite_threads()
+        codex_sessions = _load_codex_session_index()
+        for rpath, row in codex_threads.items():
+            sid = row.get("id", "")
+            if sid.startswith(prefix):
+                git_url = row.get("git_origin_url")
+                if not git_url:
+                    cwd = row.get("cwd")
+                    git_root = find_git_root(cwd) if cwd and Path(cwd).exists() else None
+                    if git_root:
+                        git_url = get_git_remote(git_root)
+                return sid, git_url
+        for sid, info in codex_sessions.items():
+            if sid.startswith(prefix):
+                return sid, None
         return prefix, None
 
     # If multiple matches but they all share the same session ID, pick the
@@ -1812,9 +1838,21 @@ def get_chat_name_by_id(chat_id: str | None) -> str | None:
                 continue
             if best is None or size > best[0]:
                 best = (size, f)
-    if best is None:
-        return None
-    return get_conversation_title(best[1])
+    if best is not None:
+        return get_conversation_title(best[1])
+    codex_sessions = _load_codex_session_index()
+    for sid, info in codex_sessions.items():
+        if sid.startswith(chat_id):
+            return info.get("thread_name")
+    codex_threads = _load_codex_sqlite_threads()
+    for rpath, row in codex_threads.items():
+        sid = row.get("id", "")
+        if sid.startswith(chat_id):
+            title = row.get("title", "")
+            if len(title) <= 120:
+                return title
+            return row.get("first_user_message", "")[:80] or None
+    return None
 
 
 def resolve_repo_filter(repo_filter: str) -> str:
@@ -2309,7 +2347,8 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
     for entry in entries:
         fname = entry["path"].name
         if chat_filters and not codex_name_matches_chat_filters(
-            fname, chat_filters, title=entry.get("title")
+            fname, chat_filters, title=entry.get("title"),
+            session_id=entry.get("session_id")
         ):
             continue
         by_name[fname] = entry
@@ -2370,7 +2409,11 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
 
     if not args.push_only:
         for local_name, (remote_name, remote) in remote_by_local.items():
-            if chat_filters and not codex_name_matches_chat_filters(remote_name, chat_filters):
+            sid_match = re.search(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', local_name)
+            remote_sid = sid_match.group(1) if sid_match else None
+            if chat_filters and not codex_name_matches_chat_filters(
+                remote_name, chat_filters, session_id=remote_sid
+            ):
                 continue
             if local_name in by_name:
                 continue
@@ -2448,7 +2491,8 @@ def sync_codex_push(service, root_folder_id, codex_git_projects: dict, args) -> 
             filtered_entries = [
                 e for e in rel_entries
                 if not chat_filters or codex_name_matches_chat_filters(
-                    e["path"].name, chat_filters, title=e.get("title")
+                    e["path"].name, chat_filters, title=e.get("title"),
+                    session_id=e.get("session_id")
                 )
             ]
             local_count = len(filtered_entries)
@@ -2470,7 +2514,15 @@ def sync_codex_push(service, root_folder_id, codex_git_projects: dict, args) -> 
                 g_size = sum(e["path"].stat().st_size for e in group_entries)
                 g_title = group_entries[0].get("title") or "(untitled)"
                 g_title_short = g_title.strip().split("\n")[0][:40]
-                print(f"  ║   ╰─ [codex group] \"{g_title_short}\" ({len(group_entries)} rollouts, {format_size(g_size)})")
+                if len(group_entries) == 1:
+                    sid = group_entries[0].get("session_id", "")[:8]
+                    print(f"  ║   ╰─ {sid}  \"{g_title_short}\" ({format_size(g_size)})")
+                else:
+                    print(f"  ║   ╰─ [codex group] \"{g_title_short}\" ({len(group_entries)} rollouts, {format_size(g_size)})")
+                    for entry in sorted(group_entries, key=lambda e: e.get("session_id", "")):
+                        sid = entry.get("session_id", "")[:8]
+                        sz = format_size(entry["path"].stat().st_size)
+                        print(f"  ║      ╰─ {sid}  {sz}")
             pushed, pulled, skipped = sync_codex_files(
                 service, subfolder_id, rel_entries, args,
                 git_root=rel_entries[0].get("git_root"),
@@ -2603,7 +2655,8 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
             filtered_entries = [
                 e for e in entries
                 if not chat_filters or codex_name_matches_chat_filters(
-                    e["path"].name, chat_filters, title=e.get("title")
+                    e["path"].name, chat_filters, title=e.get("title"),
+                    session_id=e.get("session_id")
                 )
             ]
             local_count = len(filtered_entries)
@@ -2621,7 +2674,15 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
                     g_size = sum(e["path"].stat().st_size for e in group_entries)
                     g_title = group_entries[0].get("title") or "(untitled)"
                     g_title_short = g_title.strip().split("\n")[0][:40]
-                    print(f"  ║   ╰─ [codex group] \"{g_title_short}\" ({len(group_entries)} rollouts, {format_size(g_size)})")
+                    if len(group_entries) == 1:
+                        sid = group_entries[0].get("session_id", "")[:8]
+                        print(f"  ║   ╰─ {sid}  \"{g_title_short}\" ({format_size(g_size)})")
+                    else:
+                        print(f"  ║   ╰─ [codex group] \"{g_title_short}\" ({len(group_entries)} rollouts, {format_size(g_size)})")
+                        for entry in sorted(group_entries, key=lambda e: e.get("session_id", "")):
+                            sid = entry.get("session_id", "")[:8]
+                            sz = format_size(entry["path"].stat().st_size)
+                            print(f"  ║      ╰─ {sid}  {sz}")
             if pushed or pulled:
                 if args.dry_run:
                     print(f"  ║   => codex would push {pushed}, would pull {pulled}, {skipped} unchanged")
@@ -2848,9 +2909,12 @@ def run_sync(args, service, root_folder_id):
                 for fname, finfo in sub_files.items():
                     if not fname.endswith(".jsonl"):
                         continue
+                    sid_match = re.search(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', fname)
+                    fname_sid = sid_match.group(1) if sid_match else None
                     if chat_filters and not (
                         any(fname.startswith(c) for c in chat_filters)
-                        or codex_name_matches_chat_filters(fname, chat_filters)
+                        or (fname_sid and any(fname_sid.startswith(c) for c in chat_filters))
+                        or codex_name_matches_chat_filters(fname, chat_filters, session_id=fname_sid)
                     ):
                         continue
                     to_delete.append((raw_url, sub_name, fname, finfo["id"]))

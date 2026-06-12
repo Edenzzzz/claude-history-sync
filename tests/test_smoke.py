@@ -731,7 +731,7 @@ class TestCodexSupport:
         check_format(out)
         assert "[codex] git@github.com:org/repo.git" in out
         assert "codex 1 pushed, 0 pulled, 0 unchanged" in out
-        assert '[codex group] "first prompt"' in out
+        assert '"first prompt"' in out
 
         url_key = sync.normalize_git_url("git@github.com:org/repo.git")
         repo_folder_id = drive.folders[drive.root_id]["folders"][url_key]
