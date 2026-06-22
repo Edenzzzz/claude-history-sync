@@ -939,7 +939,8 @@ class TestCodexSupport:
             "updated_at": "2026-06-05T02:03:06Z",
         }]
 
-    def test_codex_sync_pushes_local_new_tail_over_newer_remote(self, tmp_path, monkeypatch):
+    def test_codex_sync_pulls_newer_remote_over_larger_local(self, tmp_path, monkeypatch):
+        """Remote is newer → pull, even if local is larger (local may be untrimmed)."""
         import sync_claude_history as sync
 
         repo = self._git_repo(tmp_path)
@@ -968,22 +969,21 @@ class TestCodexSupport:
         drive.folders[repo_folder_id]["description"] = raw_url
         codex_folder_id = drive.get_or_create_folder(None, "src", repo_folder_id)
         remote_name = f"_codex__{rollout.name}"
+        remote_content = json.dumps({
+            "timestamp": "2026-06-05T02:03:08Z",
+            "type": "session_meta",
+            "payload": {"id": "019e-local-tail", "cwd": str(repo / "src"), "git": {"repository_url": raw_url}},
+        }) + "\n"
         drive.put_file(
             codex_folder_id,
             remote_name,
-            json.dumps({
-                "timestamp": "2026-06-05T02:03:08Z",
-                "type": "session_meta",
-                "payload": {"id": "019e-local-tail", "cwd": str(repo / "src"), "git": {"repository_url": raw_url}},
-            }) + "\n",
+            remote_content,
             modified_time="2026-06-05T02:03:08Z",
         )
 
         out = run_sync([], drive, drive.root_id)
         check_format(out)
-        assert "codex 1 pushed, 0 pulled, 0 unchanged" in out
-        assert b"local latest tail" in drive.folders[codex_folder_id]["files"][remote_name]["content"]
-        assert "local latest tail" in rollout.read_text()
+        assert "codex 0 pushed, 1 pulled, 0 unchanged" in out
 
     def test_codex_remote_only_path_respects_existing_local_timestamp(self, tmp_path, monkeypatch):
         import sync_claude_history as sync

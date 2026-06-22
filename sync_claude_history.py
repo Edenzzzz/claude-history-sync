@@ -2691,43 +2691,16 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             local_is_valid_trim = fname in just_trimmed or has_pretrim_bak
             local_is_newer = local_mtime > remote_mtime
             remote_is_newer = remote_mtime > local_mtime
-            local_likely_has_new_tail = (
-                remote_size > 0 and local_size > remote_size * 1.05
-            )
-            local_likely_corrupt_shrink = (
-                remote_size > 0 and local_size <= remote_size * 0.95
-                and not local_is_valid_trim
-            )
             should_push = (
                 not args.pull_only
-                and (
-                    local_is_newer
-                    or local_is_valid_trim
-                    or (remote_is_newer and local_likely_has_new_tail)
-                )
-                and not (local_is_newer and local_likely_corrupt_shrink)
+                and (local_is_newer or local_is_valid_trim)
             )
             if should_push:
                 if not args.dry_run:
                     media = MediaFileUpload(str(local_path))
                     service.files().update(fileId=remote["id"], media_body=media).execute()
                 pushed += 1
-            elif local_is_newer and local_likely_corrupt_shrink and not args.pull_only:
-                if not args.dry_run:
-                    download_file(service, remote["id"], local_path)
-                    trim_codex_at_last_compact(local_path)
-                    if local_cwd:
-                        rewrite_codex_cwd_if_needed(local_path, local_cwd)
-                    pulled_meta = parse_codex_rollout(local_path)
-                    pulled_sid = pulled_meta.get("session_id") or entry.get("session_id") or ""
-                    pulled_meta.update({
-                        "path": local_path,
-                        "title": codex_titles.get(pulled_sid) or entry.get("title"),
-                        "session_id": pulled_sid,
-                    })
-                    pulled_entries.append(pulled_meta)
-                pulled += 1
-            elif remote_mtime > local_mtime and not args.push_only:
+            elif remote_is_newer and not args.push_only:
                 if not args.dry_run:
                     download_file(service, remote["id"], local_path)
                     trim_codex_at_last_compact(local_path)
@@ -2782,13 +2755,8 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                 local_is_valid_trim = has_pretrim_bak
                 local_is_newer = local_mtime > remote_mtime
                 remote_is_newer = remote_mtime > local_mtime
-                local_likely_has_new_tail = (
-                    remote_size > 0 and local_size > remote_size * 1.05
-                )
                 if (not args.pull_only
-                        and (local_is_newer
-                             or local_is_valid_trim
-                             or (remote_is_newer and local_likely_has_new_tail))):
+                        and (local_is_newer or local_is_valid_trim)):
                     if not args.dry_run:
                         media = MediaFileUpload(str(local_path))
                         service.files().update(fileId=remote["id"], media_body=media).execute()
@@ -2905,15 +2873,11 @@ def sync_codex_push(service, root_folder_id, codex_git_projects: dict, args) -> 
                 g_size = sum(e["path"].stat().st_size for e in group_entries)
                 g_title = group_entries[0].get("title") or "(untitled)"
                 g_title_short = g_title.strip().split("\n")[0][:40]
+                sid = group_entries[0].get("session_id", "")[:8]
                 if len(group_entries) == 1:
-                    sid = group_entries[0].get("session_id", "")[:8]
                     print(f"  ║   ╰─ {sid}  \"{g_title_short}\" ({format_size(g_size)})")
                 else:
-                    print(f"  ║   ╰─ [codex group] \"{g_title_short}\" ({len(group_entries)} rollouts, {format_size(g_size)})")
-                    for entry in sorted(group_entries, key=lambda e: e.get("session_id", "")):
-                        sid = entry.get("session_id", "")[:8]
-                        sz = format_size(entry["path"].stat().st_size)
-                        print(f"  ║      ╰─ {sid}  {sz}")
+                    print(f"  ║   ╰─ {sid}  \"{g_title_short}\" ({len(group_entries)} rollouts, {format_size(g_size)})")
             pushed, pulled, skipped = sync_codex_files(
                 service, subfolder_id, rel_entries, args,
                 git_root=rel_entries[0].get("git_root"),
@@ -3065,15 +3029,11 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
                     g_size = sum(e["path"].stat().st_size for e in group_entries)
                     g_title = group_entries[0].get("title") or "(untitled)"
                     g_title_short = g_title.strip().split("\n")[0][:40]
+                    sid = group_entries[0].get("session_id", "")[:8]
                     if len(group_entries) == 1:
-                        sid = group_entries[0].get("session_id", "")[:8]
                         print(f"  ║   ╰─ {sid}  \"{g_title_short}\" ({format_size(g_size)})")
                     else:
-                        print(f"  ║   ╰─ [codex group] \"{g_title_short}\" ({len(group_entries)} rollouts, {format_size(g_size)})")
-                        for entry in sorted(group_entries, key=lambda e: e.get("session_id", "")):
-                            sid = entry.get("session_id", "")[:8]
-                            sz = format_size(entry["path"].stat().st_size)
-                            print(f"  ║      ╰─ {sid}  {sz}")
+                        print(f"  ║   ╰─ {sid}  \"{g_title_short}\" ({len(group_entries)} rollouts, {format_size(g_size)})")
             if pushed or pulled:
                 if args.dry_run:
                     print(f"  ║   => codex would push {pushed}, would pull {pulled}, {skipped} unchanged")
