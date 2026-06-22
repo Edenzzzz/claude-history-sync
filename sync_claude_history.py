@@ -1976,6 +1976,13 @@ def format_time(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
+def mtime_rfc3339(path: Path) -> str:
+    """Return file mtime as RFC3339 UTC string for Drive modifiedTime."""
+    return datetime.fromtimestamp(
+        path.stat().st_mtime, tz=timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
 def get_conversation_title(jsonl_path: Path) -> str | None:
     """Extract the conversation title from a JSONL file.
 
@@ -2283,7 +2290,10 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
                         rewrite_cwd_if_needed(local_path, local_cwd)
                     merged_size = local_path.stat().st_size
                     media = MediaFileUpload(str(local_path))
-                    service.files().update(fileId=remote["id"], media_body=media).execute()
+                    service.files().update(
+                        fileId=remote["id"], media_body=media,
+                        body={"modifiedTime": mtime_rfc3339(local_path)},
+                    ).execute()
                     print(f"{indent}[MERGED] {fname} "
                           f"(local {format_size(local_size)} + remote {format_size(remote_size)} → {format_size(merged_size)})")
                     pushed += 1
@@ -2315,7 +2325,10 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
                     action = "WOULD PUSH" if args.dry_run else "PUSHED"
                     if not args.dry_run:
                         media = MediaFileUpload(str(local_path))
-                        service.files().update(fileId=remote["id"], media_body=media).execute()
+                        service.files().update(
+                            fileId=remote["id"], media_body=media,
+                            body={"modifiedTime": mtime_rfc3339(local_path)},
+                        ).execute()
                     print(f"{indent}[{action}] {fname} ({format_size(local_size)}, {format_time(local_mtime)})")
                     pushed += 1
             elif remote_mtime > local_mtime and not args.push_only:
@@ -2332,7 +2345,10 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
                 action = "WOULD PUSH (trimmed)" if args.dry_run else "PUSHED (trimmed)"
                 if not args.dry_run:
                     media = MediaFileUpload(str(local_path))
-                    service.files().update(fileId=remote["id"], media_body=media).execute()
+                    service.files().update(
+                        fileId=remote["id"], media_body=media,
+                        body={"modifiedTime": mtime_rfc3339(local_path)},
+                    ).execute()
                 print(f"{indent}[{action}] {fname} ({format_size(local_size)}, {format_time(local_mtime)})")
                 pushed += 1
             else:
@@ -2342,7 +2358,8 @@ def sync_files(service, folder_id, local_dir: Path, args, indent="    ",
             if not args.dry_run:
                 media = MediaFileUpload(str(local_path))
                 service.files().create(
-                    body={"name": fname, "parents": [folder_id]},
+                    body={"name": fname, "parents": [folder_id],
+                          "modifiedTime": mtime_rfc3339(local_path)},
                     media_body=media,
                 ).execute()
             print(f"{indent}[{action}] {fname} ({format_size(local_size)}, {format_time(local_mtime)})")
@@ -2548,13 +2565,17 @@ def sync_memory(service, folder_id, local_dir: Path, args, indent="    ",
                     if local_mtime > remote_mtime:
                         if not args.dry_run:
                             media = MediaFileUpload(str(md_file))
-                            service.files().update(fileId=remote["id"], media_body=media).execute()
+                            service.files().update(
+                                fileId=remote["id"], media_body=media,
+                                body={"modifiedTime": mtime_rfc3339(md_file)},
+                            ).execute()
                         pushed += 1
                 else:
                     if not args.dry_run:
                         media = MediaFileUpload(str(md_file))
                         service.files().create(
-                            body={"name": fname, "parents": [chat_folder_id]},
+                            body={"name": fname, "parents": [chat_folder_id],
+                                  "modifiedTime": mtime_rfc3339(md_file)},
                             media_body=media,
                         ).execute()
                     pushed += 1
@@ -2698,7 +2719,10 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             if should_push:
                 if not args.dry_run:
                     media = MediaFileUpload(str(local_path))
-                    service.files().update(fileId=remote["id"], media_body=media).execute()
+                    service.files().update(
+                        fileId=remote["id"], media_body=media,
+                        body={"modifiedTime": mtime_rfc3339(local_path)},
+                    ).execute()
                 pushed += 1
             elif remote_is_newer and not args.push_only:
                 if not args.dry_run:
@@ -2722,7 +2746,8 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             if not args.dry_run:
                 media = MediaFileUpload(str(local_path))
                 service.files().create(
-                    body={"name": remote_name, "parents": [folder_id]},
+                    body={"name": remote_name, "parents": [folder_id],
+                          "modifiedTime": mtime_rfc3339(local_path)},
                     media_body=media,
                 ).execute()
             pushed += 1
@@ -2759,7 +2784,10 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                         and (local_is_newer or local_is_valid_trim)):
                     if not args.dry_run:
                         media = MediaFileUpload(str(local_path))
-                        service.files().update(fileId=remote["id"], media_body=media).execute()
+                        service.files().update(
+                            fileId=remote["id"], media_body=media,
+                            body={"modifiedTime": mtime_rfc3339(local_path)},
+                        ).execute()
                     pushed += 1
                     continue
 
