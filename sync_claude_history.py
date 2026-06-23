@@ -2952,8 +2952,8 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
                 None,
             )
 
-        codex_records = []
-        seen_rel_paths = set()
+        subfolder_records = []
+        current_codex_names_by_rel = {}
         for subfolder_name, subfolder_id in sorted(remote_subfolders.items()):
             legacy_codex_folder = is_codex_drive_subfolder(subfolder_name)
             rel_path = (
@@ -2964,17 +2964,49 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
             if git_root and rel_path != "." and is_gitignored(git_root, rel_path):
                 continue
             remote_sub_files = list_remote_files(service, subfolder_id)
+            subfolder_records.append((
+                subfolder_name, subfolder_id, legacy_codex_folder, rel_path,
+                remote_sub_files,
+            ))
+            if not legacy_codex_folder:
+                current_codex_names_by_rel.setdefault(rel_path, set()).update(
+                    codex_local_name_from_remote(k)
+                    for k in remote_sub_files
+                    if is_codex_remote_file(k)
+                )
+
+        codex_records = []
+        seen_rel_paths = set()
+        for (subfolder_name, subfolder_id, legacy_codex_folder, rel_path,
+             remote_sub_files) in subfolder_records:
+            # Current-layout folders for local Codex repos were already handled
+            # by sync_codex_push(), which is bidirectional unless --pull is set.
+            if (
+                not args.pull_only
+                and not legacy_codex_folder
+                and url_key in local_by_url
+            ):
+                continue
             if legacy_codex_folder:
+                current_names = current_codex_names_by_rel.get(rel_path, set())
                 codex_remote_files = {
                     k: v for k, v in remote_sub_files.items()
-                    if not k.startswith("_") and k.endswith(".jsonl")
+                    if (
+                        not k.startswith("_")
+                        and k.endswith(".jsonl")
+                        and k not in current_names
+                    )
                 }
             else:
                 codex_remote_files = {
                     k: v for k, v in remote_sub_files.items()
                     if is_codex_remote_file(k)
                 }
-            entries = local_by_url.get(url_key, {}).get(rel_path, []) if rel_path not in seen_rel_paths else []
+            entries = (
+                local_by_url.get(url_key, {}).get(rel_path, [])
+                if rel_path not in seen_rel_paths
+                else []
+            )
             if codex_remote_files or entries:
                 seen_rel_paths.add(rel_path)
                 codex_records.append((

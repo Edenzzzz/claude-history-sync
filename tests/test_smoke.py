@@ -855,13 +855,16 @@ class TestCodexSupport:
 
         out = run_sync(["--push"], drive, drive.root_id)
         check_format(out)
-        assert "[codex] git@github.com:org/repo.git" in out
+        assert any(
+            "║ [codex] " in line and "org/repo.git" in line
+            for line in out.splitlines()
+        )
         assert "codex 1 pushed, 0 pulled, 0 unchanged" in out
         assert '"first prompt"' in out
 
         url_key = sync.normalize_git_url("git@github.com:org/repo.git")
         repo_folder_id = drive.folders[drive.root_id]["folders"][url_key]
-        assert drive.folders[repo_folder_id]["description"] == "git@github.com:org/repo.git"
+        assert drive.folders[repo_folder_id]["description"].endswith("org/repo.git")
         metadata = json.loads(drive.folders[repo_folder_id]["files"]["_metadata.json"]["content"])
         assert metadata["sources"] == ["claude", "codex"]
 
@@ -938,6 +941,36 @@ class TestCodexSupport:
             "thread_name": "remote prompt",
             "updated_at": "2026-06-05T02:03:06Z",
         }]
+
+    def test_codex_dedupes_current_and_legacy_remote_rows(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        repo = self._git_repo(tmp_path)
+        codex_home = tmp_path / ".codex"
+        rollout = self._codex_rollout(codex_home, repo, session_id="019e-dupe")
+        monkeypatch.setattr(sync, "CODEX_HOME", codex_home)
+        monkeypatch.setattr(sync, "CLAUDE_PROJECTS_DIR", tmp_path / "empty-claude")
+        drive = self._patch_fake_drive(monkeypatch, sync)
+
+        raw_url = "git@github.com:org/repo.git"
+        url_key = sync.normalize_git_url(raw_url)
+        repo_folder_id = drive.get_or_create_folder(None, url_key, drive.root_id)
+        drive.folders[repo_folder_id]["description"] = raw_url
+        current_folder_id = drive.get_or_create_folder(None, "src", repo_folder_id)
+        legacy_folder_id = drive.get_or_create_folder(None, "_codex__src", repo_folder_id)
+        content = rollout.read_text()
+        drive.put_file(current_folder_id, f"_codex__{rollout.name}", content)
+        drive.put_file(legacy_folder_id, rollout.name, content)
+        monkeypatch.setattr(sync, "scan_local_git_repos", lambda: {url_key: (str(repo), raw_url)})
+
+        out = run_sync(["--dry-run"], drive, drive.root_id)
+        check_format(out)
+        repo_headers = [
+            line for line in out.splitlines()
+            if "║ [codex] " in line and "org/repo.git" in line
+        ]
+        assert len(repo_headers) == 1
+        assert out.count("[codex] src") == 1
 
     def test_codex_sync_pulls_newer_remote_over_larger_local(self, tmp_path, monkeypatch):
         """Remote is newer → pull, even if local is larger (local may be untrimmed)."""
