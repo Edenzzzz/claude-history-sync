@@ -44,6 +44,14 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+if sys.version_info < (3, 10):
+    print(
+        "ERROR: Python 3.10+ is required. Run with a newer interpreter, "
+        "e.g. `uv run --python 3.11 python sync_claude_history.py`.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 import google_auth_httplib2
 import httplib2
 from google.auth.transport.requests import Request

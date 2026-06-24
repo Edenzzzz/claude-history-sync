@@ -61,6 +61,13 @@ Conversations are organized by **git remote URL**, so they follow the repo — n
 
 ### 2️⃣ Install dependencies
 
+Requires Python 3.10 or newer. If your default `python` is older, run commands
+through `uv`:
+
+```bash
+uv run --python 3.11 python sync_claude_history.py --dry-run
+```
+
 ```bash
 pip install -r requirements.txt
 ```

@@ -3,6 +3,7 @@
 ## v0.1.7
 
 - Fix duplicate Codex repo output when both current `_root/_codex__...` and legacy `_codex__root/...` remote rollout folders exist for the same repo/path.
+- Require Python 3.10+ with a clear startup error on older interpreters
 - Group Codex rollouts by title in sync output: rollouts sharing the same first user message are collapsed into `[codex group]` lines with rollout count and total size; individual rollout file lines are fully suppressed (not shown even in verbose mode). `--chat` now matches Codex titles (e.g. `--chat humanize` selects all rollouts whose title contains "humanize"). Fix duplicate Codex sections in pull phase when multiple remote subfolders map to the same rel_path.
 - Skip empty repo sections in sync output: repos where all subfolders have 0 local and 0 remote conversations are no longer displayed (previously showed empty `0 local / 0 remote` rows).
 - **Fix `--push` pulling files due to 95% size guard**: the "local shrunk" guard reversed push direction when local files were smaller than remote (e.g. after trim). Now respects `--push` (never pulls) and also skips the guard when a `.pretrim.bak` exists (file was trimmed in a prior sync cycle).
