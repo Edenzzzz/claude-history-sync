@@ -65,10 +65,30 @@ SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 GOOGLE_API_HOSTS = ["oauth2.googleapis.com", "www.googleapis.com"]
 
 
+def _local_proxy_override():
+    """Read optional local-only proxy overrides from sync.local.env.
+
+    The file is gitignored and uses simple KEY=VALUE lines. Supported keys:
+    SYNC_CLAUDE_HISTORY_PROXY and GOOGLE_API_PROXY.
+    """
+    env_path = Path(__file__).parent / "sync.local.env"
+    if not env_path.exists():
+        return None
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() in {"SYNC_CLAUDE_HISTORY_PROXY", "GOOGLE_API_PROXY"}:
+            return value.strip().strip("'\"")
+    return None
+
+
 def _configured_proxy_url():
     return (
         os.environ.get("SYNC_CLAUDE_HISTORY_PROXY")
         or os.environ.get("GOOGLE_API_PROXY")
+        or _local_proxy_override()
         or os.environ.get("https_proxy")
         or os.environ.get("HTTPS_PROXY")
         or os.environ.get("http_proxy")
