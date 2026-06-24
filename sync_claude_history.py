@@ -67,7 +67,9 @@ GOOGLE_API_HOSTS = ["oauth2.googleapis.com", "www.googleapis.com"]
 
 def _configured_proxy_url():
     return (
-        os.environ.get("https_proxy")
+        os.environ.get("SYNC_CLAUDE_HISTORY_PROXY")
+        or os.environ.get("GOOGLE_API_PROXY")
+        or os.environ.get("https_proxy")
         or os.environ.get("HTTPS_PROXY")
         or os.environ.get("http_proxy")
         or os.environ.get("HTTP_PROXY")
