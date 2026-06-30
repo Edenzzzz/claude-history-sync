@@ -1424,7 +1424,7 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     if compact_idx < 0:
         return False, before_size, before_size
 
-    # Preserve leading contiguous block of ``type=summary`` entries
+    # Preserve leading contiguous block of ``type=summary`` entries (title meta)
     leading_summary_end = 0
     for i, d in enumerate(parsed):
         if d is None:
@@ -1437,71 +1437,116 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     if compact_idx < leading_summary_end:
         return False, before_size, before_size
 
+    compact_uuid = parsed[compact_idx].get("uuid")
+
+    # Map uuid -> line index for valid records (first occurrence wins).
+    uuid_to_idx: dict[str, int] = {}
+    for i, d in enumerate(parsed):
+        if d is not None:
+            u = d.get("uuid")
+            if u and u not in uuid_to_idx:
+                uuid_to_idx[u] = i
+
+    # Identify the active leaf: the most recent mainline message.  Claude Code
+    # reconstructs a resumed transcript by walking ``parentUuid`` *backward*
+    # from this leaf, so whatever is reachable from it is exactly what loads —
+    # and nothing else.  Trimming therefore has to keep that chain intact, not
+    # an arbitrary file-order suffix (the old behaviour, which silently severed
+    # the chain when the active branch was not contiguous in file order).
+    leaf_idx = -1
+    for i in range(len(parsed) - 1, -1, -1):
+        d = parsed[i]
+        if (d is not None and d.get("uuid")
+                and d.get("type") in ("user", "assistant")
+                and not d.get("isSidechain")):
+            leaf_idx = i
+            break
+    if leaf_idx < 0:
+        for i in range(len(parsed) - 1, -1, -1):
+            if parsed[i] is not None and parsed[i].get("uuid"):
+                leaf_idx = i
+                break
+
+    # Walk the leaf's ancestor chain.  Stop *at* the first compaction summary
+    # we reach (it becomes the new root — its own ``parentUuid`` may dangle,
+    # which Claude Code handles fine); otherwise stop at a null/missing parent.
+    chain_set: set[int] = set()
+    cur = leaf_idx
+    reached_compact = False
+    while cur is not None and cur >= 0 and cur not in chain_set:
+        chain_set.add(cur)
+        d = parsed[cur]
+        if d is not None and d.get("isCompactSummary") is True:
+            reached_compact = True
+            break
+        parent = d.get("parentUuid") if d is not None else None
+        if not parent:
+            break
+        cur = uuid_to_idx.get(parent, -1)
+
     invalid_retained_lines = [
         i for i in range(compact_idx, len(lines))
         if lines[i].strip() and parsed[i] is None
     ]
 
-    # Idempotency check: if the compact entry is already the first
-    # non-summary line and all retained rows are valid JSON, the file is
-    # already trimmed. Skip the rewrite to avoid churning mtime/md5 every sync
-    # cycle.
-    if compact_idx == leading_summary_end and not invalid_retained_lines:
-        return False, before_size, before_size
+    # Retain set (by line index):
+    #   - leading summary/title metadata
+    #   - the compaction summary itself
+    #   - every valid record at or after the compact point (post-compact tail,
+    #     structural rows such as file-history-snapshot, sidechains)
+    #   - the leaf's full ancestor chain (keeps the chain connected even when
+    #     the active branch dips *before* the compact point in file order)
+    keep_idx: set[int] = set(chain_set)
+    keep_idx.add(compact_idx)
+    for i in range(leading_summary_end):
+        if parsed[i] is not None and parsed[i].get("type") == "summary":
+            keep_idx.add(i)
+    for i in range(compact_idx, len(parsed)):
+        if parsed[i] is not None:
+            keep_idx.add(i)
 
-    compact_entry = parsed[compact_idx]
-    compact_entry = dict(compact_entry)
-    # Keep the original parentUuid — a dangling reference to a removed entry
-    # is fine.  Nulling it out breaks Claude Code's tree-walking on resume:
-    # CC treats parentUuid=None as a brand-new session root and creates a
-    # disconnected branch instead of loading the compaction summary.
+    kept_uuids = {
+        parsed[i].get("uuid") for i in keep_idx
+        if parsed[i] is not None and parsed[i].get("uuid")
+    }
+
+    # Reconnect any retained record whose parent was dropped (or never existed)
+    # to the compaction summary, so the chain from the leaf always flows into
+    # it.  The summary row itself keeps its (possibly dangling) parent so it
+    # acts as the conversation root.
+    fixed_lines: dict[int, str] = {}   # line_idx -> rewritten JSON line
+    graft_count = 0
+    for i in keep_idx:
+        d = parsed[i]
+        if d is None or i == compact_idx:
+            continue
+        parent = d.get("parentUuid")
+        if parent and parent not in kept_uuids and parent != compact_uuid:
+            nd = dict(d)
+            nd["parentUuid"] = compact_uuid
+            fixed_lines[i] = json.dumps(nd, ensure_ascii=False) + "\n"
+            graft_count += 1
+
+    dropped_any = any(
+        parsed[i] is not None and i not in keep_idx
+        for i in range(len(parsed))
+    )
+
+    # Idempotency: nothing dropped, nothing grafted, no malformed retained rows,
+    # the summary is already the first non-summary row, and the leaf can already
+    # reach it.  Skip the rewrite to avoid churning mtime/md5 every sync cycle.
+    if (not dropped_any and not graft_count and not invalid_retained_lines
+            and reached_compact and compact_idx == leading_summary_end):
+        return False, before_size, before_size
 
     bak = jsonl_path.with_suffix(jsonl_path.suffix + ".pretrim.bak")
     if not bak.exists():
         shutil.copy2(jsonl_path, bak)
 
-    # Collect UUIDs that will survive the trim (compact entry + everything
-    # after it, plus leading summaries).
-    surviving_uuids = set()
-    for i in range(leading_summary_end):
-        if parsed[i] is not None:
-            u = parsed[i].get("uuid")
-            if u:
-                surviving_uuids.add(u)
-    surviving_uuids.add(compact_entry.get("uuid", ""))
-    for i in range(compact_idx + 1, len(parsed)):
-        if parsed[i] is not None:
-            u = parsed[i].get("uuid")
-            if u:
-                surviving_uuids.add(u)
-
-    # Fix dangling parentUuids: entries after the compact point whose parent
-    # was in the trimmed portion.  Reconnect them to the compact entry so the
-    # conversation tree stays fully connected for Claude Code's resume.
-    compact_uuid = compact_entry.get("uuid")
-    fixed_lines: dict[int, str] = {}   # line_idx -> rewritten JSON line
-    for i in range(compact_idx + 1, len(parsed)):
-        d = parsed[i]
-        if d is None:
-            continue
-        parent = d.get("parentUuid")
-        if parent and parent not in surviving_uuids:
-            d = dict(d)
-            d["parentUuid"] = compact_uuid
-            fixed_lines[i] = json.dumps(d, ensure_ascii=False) + "\n"
-
     tmp = jsonl_path.with_suffix(jsonl_path.suffix + ".trim.tmp")
     with open(tmp, "w") as f:
-        for i in range(leading_summary_end):
-            if parsed[i] is None:
-                continue
-            line = lines[i]
-            f.write(line if line.endswith("\n") else line + "\n")
-        f.write(json.dumps(compact_entry, ensure_ascii=False) + "\n")
-        for i in range(compact_idx + 1, len(lines)):
-            if not lines[i].strip():
-                continue
-            if parsed[i] is None:
+        for i in range(len(lines)):
+            if i not in keep_idx or parsed[i] is None:
                 continue
             if i in fixed_lines:
                 f.write(fixed_lines[i])

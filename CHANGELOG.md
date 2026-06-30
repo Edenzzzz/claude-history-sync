@@ -2,6 +2,7 @@
 
 ## v0.1.7
 
+- **Fix trim severing the resume chain (empty session on resume)**: `trim_at_last_compact` retained rows by file-order suffix, dropping the active leaf's ancestors when the live branch wasn't contiguous in file order (e.g. multiple compactions on divergent branches), which orphaned the compaction summary so `claude --resume` loaded with no context. Now retains rows by `parentUuid` reachability from the active leaf and grafts danglers onto the compaction summary.
 - Fix duplicate Codex repo output when both current `_root/_codex__...` and legacy `_codex__root/...` remote rollout folders exist for the same repo/path.
 - Require Python 3.10+ with a clear startup error on older interpreters
 - Group Codex rollouts by title in sync output: rollouts sharing the same first user message are collapsed into `[codex group]` lines with rollout count and total size; individual rollout file lines are fully suppressed (not shown even in verbose mode). `--chat` now matches Codex titles (e.g. `--chat humanize` selects all rollouts whose title contains "humanize"). Fix duplicate Codex sections in pull phase when multiple remote subfolders map to the same rel_path.

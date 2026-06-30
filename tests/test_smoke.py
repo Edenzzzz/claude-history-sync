@@ -34,6 +34,9 @@ def drive():
 
 def test_configured_proxy_url_prefers_https(monkeypatch):
     import sync_claude_history as sync
+    monkeypatch.delenv("SYNC_CLAUDE_HISTORY_PROXY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_PROXY", raising=False)
+    monkeypatch.setattr(sync, "_local_proxy_override", lambda: None)
     monkeypatch.delenv("http_proxy", raising=False)
     monkeypatch.delenv("https_proxy", raising=False)
     monkeypatch.setenv("HTTP_PROXY", "http://http-proxy.example:3128")
@@ -63,6 +66,9 @@ def test_build_drive_service_uses_proxy(monkeypatch):
             captured["creds"] = creds
             captured["http"] = http
 
+    monkeypatch.delenv("SYNC_CLAUDE_HISTORY_PROXY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_PROXY", raising=False)
+    monkeypatch.setattr(sync, "_local_proxy_override", lambda: None)
     monkeypatch.delenv("http_proxy", raising=False)
     monkeypatch.delenv("https_proxy", raising=False)
     monkeypatch.setenv("HTTPS_PROXY", "http://localhost:9090")
@@ -445,6 +451,77 @@ class TestTrimCompact:
 
         kept = [json.loads(line) for line in p.read_bytes().splitlines()]
         assert [row["uuid"] for row in kept] == ["c1", "a1", "u2"]
+
+    def test_trim_keeps_active_leaf_chain_connected(self, tmp_path):
+        """Regression: the active leaf must still reach a compaction summary
+        after trimming, even when the *last* compaction (by file order) is on a
+        divergent dead branch and the live branch roots at an earlier one.
+
+        The old file-order trim kept only rows at/after the last compaction
+        marker, which orphaned the leaf's real summary and made ``claude
+        --resume`` open with no context.
+        """
+        import json
+        from sync_claude_history import trim_at_last_compact
+
+        p = tmp_path / "conv.jsonl"
+        rows = [
+            # pre-compact bulk (should be dropped)
+            {"type": "user", "uuid": "u0", "parentUuid": None,
+             "message": {"role": "user", "content": "old bulk"}},
+            # FIRST compaction — the live branch roots here
+            {"type": "user", "uuid": "c_first", "parentUuid": "u0",
+             "isCompactSummary": True,
+             "message": {"role": "user", "content": "FIRST SUMMARY context"}},
+            {"type": "user", "uuid": "u_a", "parentUuid": "c_first",
+             "message": {"role": "user", "content": "work A"}},
+            {"type": "assistant", "uuid": "a_a", "parentUuid": "u_a",
+             "message": {"role": "assistant", "content": "reply A"}},
+            # SECOND compaction on a DIVERGENT branch (parent is pre-compact u0),
+            # last in file order — old code anchored the whole trim here.
+            {"type": "user", "uuid": "c_last", "parentUuid": "u0",
+             "isCompactSummary": True,
+             "message": {"role": "user", "content": "DEAD BRANCH SUMMARY"}},
+            {"type": "user", "uuid": "u_dead", "parentUuid": "c_last",
+             "message": {"role": "user", "content": "dead work"}},
+            # the actual leaf — descends from the FIRST compaction's branch
+            {"type": "assistant", "uuid": "a_leaf", "parentUuid": "a_a",
+             "message": {"role": "assistant", "content": "latest reply"}},
+        ]
+        with open(p, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+        trimmed, before, after = trim_at_last_compact(p)
+        assert trimmed is True
+        assert after < before
+
+        kept = [json.loads(line) for line in p.read_text().splitlines() if line.strip()]
+        by_uuid = {r["uuid"]: r for r in kept if r.get("uuid")}
+
+        # Pre-compact bulk dropped; the live chain fully retained.
+        assert "u0" not in by_uuid
+        for uid in ("c_first", "u_a", "a_a", "a_leaf"):
+            assert uid in by_uuid, f"{uid} missing — chain was severed"
+
+        # Walk parentUuid backward from the leaf exactly like `claude --resume`
+        # does; it must reach a compaction summary without hitting a missing
+        # parent (that is the difference between "context" and "no context").
+        cur = by_uuid["a_leaf"]
+        seen, reached_summary = set(), False
+        while cur and cur["uuid"] not in seen:
+            seen.add(cur["uuid"])
+            if cur.get("isCompactSummary"):
+                reached_summary = True
+                break
+            parent = cur.get("parentUuid")
+            if not parent:
+                break
+            cur = by_uuid.get(parent)
+        assert reached_summary, "leaf cannot reach a compaction summary on resume"
+
+        # The reached summary carries the real prior-context text.
+        assert "FIRST SUMMARY context" in p.read_text()
 
     def test_cwd_rewrite(self, tmp_path):
         """rewrite_cwd_if_needed updates all cwd fields and preserves mtime."""
