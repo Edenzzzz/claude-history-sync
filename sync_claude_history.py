@@ -2919,6 +2919,35 @@ def sync_codex_push(service, root_folder_id, codex_git_projects: dict, args) -> 
                     print(f"  ║   ╰─ {sid}  \"{g_title_short}\" ({format_size(g_size)})")
                 else:
                     print(f"  ║   ╰─ {sid}  \"{g_title_short}\" ({len(group_entries)} rollouts, {format_size(g_size)})")
+            local_names = {e["path"].name for e in filtered_entries}
+            codex_titles = {}
+            titles_file = remote_sub_files.get("_codex_titles.json")
+            if titles_file:
+                try:
+                    codex_titles = json.loads(download_string(service, titles_file["id"]))
+                except (json.JSONDecodeError, Exception):
+                    codex_titles = {}
+            remote_only_rows = []
+            for remote_name, remote in remote_sub_files.items():
+                if not is_codex_remote_file(remote_name):
+                    continue
+                local_name = codex_local_name_from_remote(remote_name)
+                if local_name in local_names:
+                    continue
+                sid_match = re.search(
+                    r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+                    local_name,
+                )
+                sid = sid_match.group(1) if sid_match else ""
+                title = codex_titles.get(sid) or "(remote only)"
+                if chat_filters and not codex_name_matches_chat_filters(
+                    remote_name, chat_filters, title=title, session_id=sid
+                ):
+                    continue
+                remote_only_rows.append((sid, title, int(remote.get("size", 0))))
+            for sid, title, size in sorted(remote_only_rows):
+                title_short = title.strip().split("\n")[0][:40]
+                print(f"  ║   ╰─ {sid[:8]}  \"{title_short}\" ({format_size(size)}, remote)")
             pushed, pulled, skipped = sync_codex_files(
                 service, subfolder_id, rel_entries, args,
                 git_root=rel_entries[0].get("git_root"),

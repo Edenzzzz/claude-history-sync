@@ -1029,6 +1029,53 @@ class TestCodexSupport:
             "updated_at": "2026-06-05T02:03:06Z",
         }]
 
+    def test_codex_dry_run_shows_remote_only_rollout_row(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        repo = self._git_repo(tmp_path)
+        codex_home = tmp_path / ".codex"
+        self._codex_rollout(codex_home, repo, session_id="019e-local")
+        monkeypatch.setattr(sync, "CODEX_HOME", codex_home)
+        monkeypatch.setattr(sync, "CLAUDE_PROJECTS_DIR", tmp_path / "empty-claude")
+        drive = self._patch_fake_drive(monkeypatch, sync)
+
+        raw_url = "git@github.com:org/repo.git"
+        url_key = sync.normalize_git_url(raw_url)
+        repo_folder_id = drive.get_or_create_folder(None, url_key, drive.root_id)
+        drive.folders[repo_folder_id]["description"] = raw_url
+        codex_folder_id = drive.get_or_create_folder(None, "src", repo_folder_id)
+        remote_sid = "019e0000-0000-7000-8000-000000000001"
+        fname = f"rollout-2026-06-05T02-03-04-{remote_sid}.jsonl"
+        remote_name = f"_codex__{fname}"
+        rows = [
+            {
+                "timestamp": "2026-06-05T02:03:04Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": remote_sid,
+                    "cwd": str(repo / "src"),
+                    "git": {"repository_url": raw_url},
+                },
+            },
+        ]
+        drive.put_file(
+            codex_folder_id,
+            remote_name,
+            "".join(json.dumps(row) + "\n" for row in rows),
+            modified_time="2026-06-05T02:03:06Z",
+        )
+        drive.put_file(
+            codex_folder_id,
+            "_codex_titles.json",
+            json.dumps({remote_sid: "remote visible title"}),
+        )
+
+        out = run_sync(["--dry-run"], drive, drive.root_id)
+        check_format(out)
+        assert '019e0000  "remote visible title"' in out
+        assert "remote visible title\" (262B, remote)" in out
+        assert "codex would push 1, would pull 1" in out
+
     def test_codex_dedupes_current_and_legacy_remote_rows(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
 
