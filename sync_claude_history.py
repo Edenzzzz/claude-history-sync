@@ -1568,15 +1568,10 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
 def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     """Trim a Codex rollout to its last valid compact point.
 
-    Keep the ``session_meta`` header, the last valid ``type=compacted`` row, a
-    lightweight user-message event for the retained post-compact tail, and the
-    post-compact message/function-call tail.  Codex uses the user-message event
-    to backfill picker titles; the compacted row remains the resume
-    reconstruction boundary.  Bulky replay-only rows after compact (event
-    messages and function-call outputs) are dropped so ``codex resume`` can
-    reconstruct the conversation without overflowing context.  Malformed rows
-    after the compact point are dropped, but they are never used as trim
-    boundaries.
+    Keep the ``session_meta`` header, the final valid ``type=compacted`` row
+    exactly as Codex wrote it, and every row after that compact point.  The
+    compact row's full ``replacement_history`` is part of Codex's resume state;
+    do not collapse it to just the encrypted compaction item.
     """
     import shutil
 
@@ -1610,91 +1605,34 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     if compact_idx < 0:
         return False, before_size, before_size
 
-    invalid_retained_lines = [
-        i for i in range(compact_idx, len(lines))
-        if lines[i].strip() and parsed[i] is None
-    ]
     header_lines = [i for i in header_lines if i < compact_idx]
-    pre_compact_anchor_lines = _codex_picker_anchor_lines(parsed, 0, compact_idx)
-    post_compact_anchor_lines = _codex_picker_anchor_lines(
-        parsed, compact_idx + 1, min(len(parsed), compact_idx + 32)
-    )
-    synthesized_anchor = None
-    if not post_compact_anchor_lines:
-        synthesized_anchor = _codex_tail_user_event(parsed, compact_idx + 1)
-    anchor_lines = post_compact_anchor_lines or ([] if synthesized_anchor else pre_compact_anchor_lines)
-    post_compact_anchor_set = set(post_compact_anchor_lines)
-
-    compact_entry = dict(parsed[compact_idx])
-    payload = compact_entry.get("payload")
-    compact_rewrite_needed = False
-    if isinstance(payload, dict):
-        replacement_history = payload.get("replacement_history")
-        if isinstance(replacement_history, list):
-            compaction_items = [
-                item for item in replacement_history
-                if isinstance(item, dict) and item.get("type") == "compaction"
-            ]
-            if compaction_items:
-                payload = dict(payload)
-                payload["replacement_history"] = [compaction_items[-1]]
-                compact_entry["payload"] = payload
-                compact_rewrite_needed = replacement_history != [compaction_items[-1]]
-
-    dropped_retained_lines = []
-    for i in range(compact_idx + 1, len(lines)):
-        if not lines[i].strip() or parsed[i] is None:
-            continue
-        if i in post_compact_anchor_set:
-            continue
-        d = parsed[i]
-        payload = d.get("payload") if isinstance(d.get("payload"), dict) else {}
-        if d.get("type") == "event_msg":
-            dropped_retained_lines.append(i)
-        elif d.get("type") == "response_item" and payload.get("type") == "function_call_output":
-            dropped_retained_lines.append(i)
-
     valid_before_compact = [
         i for i in range(compact_idx)
         if lines[i].strip() and parsed[i] is not None
     ]
-    if (valid_before_compact == header_lines
-            and not invalid_retained_lines
-            and not compact_rewrite_needed
-            and synthesized_anchor is None
-            and not dropped_retained_lines):
+    if valid_before_compact == header_lines:
         return False, before_size, before_size
 
     bak = jsonl_path.with_suffix(jsonl_path.suffix + ".pretrim.bak")
     if not bak.exists():
         shutil.copy2(jsonl_path, bak)
 
-    tmp = jsonl_path.with_suffix(jsonl_path.suffix + ".trim.tmp")
-    with open(tmp, "wb") as f:
-        for i in header_lines:
-            line = lines[i]
-            f.write(line if line.endswith(b"\n") else line + b"\n")
-        f.write(json.dumps(compact_entry, ensure_ascii=False).encode() + b"\n")
-        if synthesized_anchor is not None:
-            f.write(json.dumps(synthesized_anchor, ensure_ascii=False).encode() + b"\n")
-        for i in anchor_lines:
-            line = lines[i]
-            f.write(line if line.endswith(b"\n") else line + b"\n")
-        for i in range(compact_idx + 1, len(lines)):
-            if not lines[i].strip() or parsed[i] is None:
-                continue
-            if i in post_compact_anchor_set:
-                continue
-            d = parsed[i]
-            if d.get("type") == "event_msg":
-                continue
-            payload = d.get("payload") if isinstance(d.get("payload"), dict) else {}
-            if d.get("type") == "response_item" and payload.get("type") == "function_call_output":
-                continue
-            line = lines[i]
-            f.write(line if line.endswith(b"\n") else line + b"\n")
+    trimmed_lines: list[bytes] = []
+    for i in header_lines:
+        line = lines[i]
+        trimmed_lines.append(line if line.endswith(b"\n") else line + b"\n")
+    for i in range(compact_idx, len(lines)):
+        line = lines[i]
+        trimmed_lines.append(line if line.endswith(b"\n") else line + b"\n")
 
-    tmp.replace(jsonl_path)
+    # Rewrite in place so an active Codex process that has this JSONL open for
+    # append keeps writing to the trimmed file instead of an unlinked old inode.
+    with open(jsonl_path, "r+b") as f:
+        f.seek(0)
+        f.writelines(trimmed_lines)
+        f.truncate()
+        f.flush()
+        os.fsync(f.fileno())
     try:
         os.utime(jsonl_path, (before_stat.st_atime, before_mtime))
     except OSError:

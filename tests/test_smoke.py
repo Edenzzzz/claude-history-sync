@@ -864,27 +864,37 @@ class TestCodexSupport:
                     f.write(row + b"\n")
                 else:
                     f.write(json.dumps(row).encode() + b"\n")
-
+        before_inode = p.stat().st_ino
         trimmed, before, after = trim_codex_at_last_compact(p)
         assert trimmed is True
         assert after < before
+        assert p.stat().st_ino == before_inode
 
-        kept = [json.loads(line) for line in p.read_bytes().splitlines()]
-        assert [row["type"] for row in kept] == [
-            "session_meta", "compacted", "event_msg", "response_item", "response_item"
+        kept = []
+        for line in p.read_bytes().splitlines():
+            try:
+                kept.append(json.loads(line))
+            except json.JSONDecodeError:
+                kept.append(None)
+        assert [row["type"] if isinstance(row, dict) else None for row in kept] == [
+            "session_meta", "compacted", "event_msg", "response_item",
+            "response_item", None, "response_item"
         ]
         assert kept[1]["payload"]["replacement_history"] == [
+            {"type": "message", "role": "user", "content": "summary"},
             {"type": "compaction", "encrypted_content": "opaque-summary"}
         ]
-        assert kept[2]["payload"]["message"] == "tail"
-        assert kept[3]["payload"]["role"] == "assistant"
+        assert kept[2]["payload"]["message"] == "replay-only status"
+        assert kept[3]["payload"]["type"] == "function_call_output"
+        assert kept[4]["payload"]["role"] == "assistant"
         assert kept[-1]["payload"]["content"] == "tail"
         assert parse_codex_rollout(p)["first_user_message"] == "tail"
         assert p.with_suffix(".jsonl.pretrim.bak").exists()
 
+        once_trimmed = p.read_bytes()
         trimmed_again, _, _ = trim_codex_at_last_compact(p)
         assert trimmed_again is False
-        assert [json.loads(line) for line in p.read_bytes().splitlines()] == kept
+        assert p.read_bytes() == once_trimmed
 
     def test_board_shows_claude_and_codex_prefixes(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
