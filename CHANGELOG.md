@@ -2,6 +2,7 @@
 
 ## v0.1.7
 
+- Treat GitHub's `ssh.github.com` SSH alias as `github.com` when normalizing repo remotes so both forms sync under the same Drive folder.
 - Show remote-only Codex rollouts in the project board so dry-run output names chats that would be pulled instead of only counting them.
 - Fix Codex trim equivalence: preserve the final compacted row's full `replacement_history` and exact post-compact rows so `codex resume` opens on the live tail instead of the fork/start prompt.
 - **Fix trim severing the resume chain (empty session on resume)**: `trim_at_last_compact` retained rows by file-order suffix, dropping the active leaf's ancestors when the live branch wasn't contiguous in file order (e.g. multiple compactions on divergent branches), which orphaned the compaction summary so `claude --resume` loaded with no context. Now retains rows by `parentUuid` reachability from the active leaf and grafts danglers onto the compaction summary.

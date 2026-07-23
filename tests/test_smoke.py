@@ -565,6 +565,15 @@ class TestTrimCompact:
 
 
 class TestCodexSupport:
+    def test_github_ssh_alias_normalizes_to_github_host(self):
+        import sync_claude_history as sync
+
+        canonical = sync.normalize_git_url("git@github.com:Edenzzzz/sglang-dev.git")
+        ssh_alias = sync.normalize_git_url("git@ssh.github.com:Edenzzzz/sglang-dev.git")
+
+        assert ssh_alias == canonical
+        assert canonical == "github.com__Edenzzzz__sglang-dev"
+
     class _FakeRequest:
         def __init__(self, fn):
             self._fn = fn

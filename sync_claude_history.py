@@ -447,18 +447,25 @@ def normalize_git_url(url: str) -> str:
     """Normalize git remote URL to a stable folder name.
 
     git@github.com:flashinfer-ai/flashinfer.git -> github.com__flashinfer-ai__flashinfer
+    git@ssh.github.com:flashinfer-ai/flashinfer.git -> github.com__flashinfer-ai__flashinfer
     https://github.com/flashinfer-ai/flashinfer.git -> github.com__flashinfer-ai__flashinfer
     """
+    def canonical_host(host: str) -> str:
+        host = host.lower()
+        if host == "ssh.github.com":
+            return "github.com"
+        return host
+
     url = url.strip()
     # SSH format: git@host:org/repo.git
     m = re.match(r"git@([^:]+):(.+?)(?:\.git)?$", url)
     if m:
-        host, path = m.group(1), m.group(2)
+        host, path = canonical_host(m.group(1)), m.group(2)
         return f"{host}__{path.replace('/', '__')}"
     # HTTPS format: https://host/org/repo.git
     m = re.match(r"https?://([^/]+)/(.+?)(?:\.git)?$", url)
     if m:
-        host, path = m.group(1), m.group(2)
+        host, path = canonical_host(m.group(1)), m.group(2)
         return f"{host}__{path.replace('/', '__')}"
     # Fallback: sanitize
     return re.sub(r"[^\w.-]", "__", url)
