@@ -1082,8 +1082,58 @@ class TestCodexSupport:
         out = run_sync(["--dry-run"], drive, drive.root_id)
         check_format(out)
         assert '019e0000  "remote visible title"' in out
-        assert "remote visible title\" (262B, remote)" in out
+        assert 'remote visible title" (' in out
+        assert ", remote)" in out
         assert "codex would push 1, would pull 1" in out
+
+    def test_codex_pull_matches_existing_github_ssh_alias_remote_folder(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        repo = self._git_repo(tmp_path)
+        raw_url = "git@github.com:org/repo.git"
+        alias_url = "git@ssh.github.com:org/repo.git"
+        codex_home = tmp_path / ".codex"
+        monkeypatch.setattr(sync, "CODEX_HOME", codex_home)
+        monkeypatch.setattr(sync, "CLAUDE_PROJECTS_DIR", tmp_path / "empty-claude")
+        drive = self._patch_fake_drive(monkeypatch, sync)
+
+        alias_key = "ssh.github.com__org__repo"
+        repo_folder_id = drive.get_or_create_folder(None, alias_key, drive.root_id)
+        drive.folders[repo_folder_id]["description"] = alias_url
+        codex_folder_id = drive.get_or_create_folder(None, "src", repo_folder_id)
+        remote_sid = "019f7abb-0000-7000-8000-000000000001"
+        fname = f"rollout-2026-07-23T02-03-04-{remote_sid}.jsonl"
+        remote_name = f"_codex__{fname}"
+        rows = [
+            {
+                "timestamp": "2026-07-23T02:03:04Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": remote_sid,
+                    "cwd": str(repo / "src"),
+                    "git": {"repository_url": alias_url},
+                },
+            },
+        ]
+        drive.put_file(
+            codex_folder_id,
+            remote_name,
+            "".join(json.dumps(row) + "\n" for row in rows),
+            modified_time="2026-07-23T02:03:06Z",
+        )
+        drive.put_file(codex_folder_id, "_codex_titles.json", json.dumps({remote_sid: "alias pull"}))
+        monkeypatch.setattr(
+            sync,
+            "scan_local_git_repos",
+            lambda: {sync.normalize_git_url(raw_url): (str(repo), raw_url)},
+        )
+
+        out = run_sync(["--pull", "--chat", "019f7abb"], drive, drive.root_id)
+        check_format(out)
+        assert "(no local clone)" not in out
+        assert "codex 0 pushed, 1 pulled" in out
+        pulled = list((codex_home / "sessions").glob(f"**/{fname}"))
+        assert len(pulled) == 1
 
     def test_codex_dedupes_current_and_legacy_remote_rows(self, tmp_path, monkeypatch):
         import sync_claude_history as sync

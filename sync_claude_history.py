@@ -471,6 +471,20 @@ def normalize_git_url(url: str) -> str:
     return re.sub(r"[^\w.-]", "__", url)
 
 
+def canonical_normalized_git_key(key: str) -> str:
+    """Canonicalize an already-normalized git remote folder key."""
+    if key.startswith("ssh.github.com__"):
+        return "github.com__" + key.removeprefix("ssh.github.com__")
+    return key
+
+
+def remote_folder_match_key(url_key: str, raw_url: str | None = None) -> str:
+    """Return the canonical local index key for a Drive repo folder."""
+    if raw_url and raw_url != url_key:
+        return normalize_git_url(raw_url)
+    return canonical_normalized_git_key(url_key)
+
+
 def resolve_claude_project_path(project_dir_name: str) -> str | None:
     """Convert claude project dir name to local filesystem path.
 
@@ -2988,15 +3002,16 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
     for url_key, folder_info in sorted(remote_repo_folders.items()):
         repo_fid = folder_info["id"]
         raw_url = folder_info.get("description") or url_key
+        match_key = remote_folder_match_key(url_key, raw_url)
         if not repo_matches_filter(raw_url, args.repo):
             continue
         remote_subfolders = list_drive_folders(service, repo_fid)
-        repo_match = local_repos.get(url_key)
+        repo_match = local_repos.get(match_key)
         git_root = repo_match[0] if repo_match else None
         raw_url = repo_match[1] if repo_match else raw_url
-        if not git_root and url_key in local_by_url:
+        if not git_root and match_key in local_by_url:
             git_root = next(
-                (e.get("git_root") for entries in local_by_url[url_key].values()
+                (e.get("git_root") for entries in local_by_url[match_key].values()
                  for e in entries if e.get("git_root")),
                 None,
             )
@@ -3033,7 +3048,7 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
             if (
                 not args.pull_only
                 and not legacy_codex_folder
-                and url_key in local_by_url
+                and match_key in local_by_url
             ):
                 continue
             if legacy_codex_folder:
@@ -3052,7 +3067,7 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
                     if is_codex_remote_file(k)
                 }
             entries = (
-                local_by_url.get(url_key, {}).get(rel_path, [])
+                local_by_url.get(match_key, {}).get(rel_path, [])
                 if rel_path not in seen_rel_paths
                 else []
             )
@@ -3591,15 +3606,16 @@ def run_sync(args, service, root_folder_id):
         repo_meta = {}  # url_key -> raw_url
         repos_needing_meta = []  # repos where we need to download _metadata.json
         for url_key, folder_info in sorted(remote_repo_folders.items()):
-            if url_key in git_projects and not args.pull_only:
-                continue
             repo_fid = folder_info["id"]
             desc = folder_info.get("description", "")
+            match_key = remote_folder_match_key(url_key, desc or None)
+            if match_key in git_projects and not args.pull_only:
+                continue
             if desc:
                 repo_meta[url_key] = desc
             else:
                 repos_needing_meta.append((url_key, repo_fid))
-            pull_repos.append((url_key, repo_fid))
+            pull_repos.append((url_key, repo_fid, match_key))
 
         # Batch-fetch repo-level files only for repos without description (need _metadata.json)
         if repos_needing_meta:
@@ -3630,10 +3646,14 @@ def run_sync(args, service, root_folder_id):
                 desc_batch.execute()
 
         repos_to_list = {}
-        for url_key, repo_fid in pull_repos:
+        pull_repos_with_match = []
+        for url_key, repo_fid, match_key in pull_repos:
             raw_url = repo_meta.get(url_key, url_key)
             if repo_matches_filter(raw_url, args.repo):
                 repos_to_list[url_key] = repo_fid
+                pull_repos_with_match.append((
+                    url_key, repo_fid, remote_folder_match_key(url_key, raw_url)
+                ))
 
         # Batch-fetch subfolders for all filtered repos
         all_subfolders = batch_list_drive_folders(service, repos_to_list)
@@ -3647,7 +3667,7 @@ def run_sync(args, service, root_folder_id):
 
         pull_printed_first = push_printed_any
         local_repos = scan_local_git_repos()
-        for url_key, repo_fid in pull_repos:
+        for url_key, repo_fid, match_key in pull_repos_with_match:
             raw_url = repo_meta.get(url_key, url_key)
             remote_subfolders = all_subfolders.get(url_key)
 
@@ -3657,15 +3677,15 @@ def run_sync(args, service, root_folder_id):
             if remote_subfolders is None:
                 continue
 
-            if url_key not in local_by_url:
+            if match_key not in local_by_url:
                 # Try to find local git clone to auto-create Claude project dir
                 found_root = None
-                if url_key in local_repos:
-                    found_root = local_repos[url_key][0]
+                if match_key in local_repos:
+                    found_root = local_repos[match_key][0]
                 if found_root:
                     # Populate local_by_url with git_root only (no project_dir yet)
                     # so pull_git_root is set and subfolder sync auto-creates project dirs
-                    local_by_url[url_key] = {".": (None, found_root)}
+                    local_by_url[match_key] = {".": (None, found_root)}
                 else:
                     total_convos = 0
                     total_size = 0
@@ -3686,7 +3706,7 @@ def run_sync(args, service, root_folder_id):
                     print(B)
                     continue
 
-            local_map = local_by_url[url_key]
+            local_map = local_by_url[match_key]
 
             B = "  ╠═══════════════════════════════════════════════════════════════════════════"
             pull_git_root = None
