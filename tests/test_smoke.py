@@ -93,6 +93,7 @@ def _parse_args(args_list):
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--repo", type=str, default=None)
     parser.add_argument("--chat", type=str, default=None, dest="chat_id")
+    parser.add_argument("--target-dir", type=str, default=None)
     parser.add_argument("--background", type=int, nargs="?", const=600, default=None)
     parser.add_argument("--remove-job", action="store_true")
     parser.add_argument("--merge", nargs=2, default=None)
@@ -1366,6 +1367,46 @@ class TestCodexSupport:
         pulled = [json.loads(line) for line in (local_dir / fname).read_text().splitlines()]
         assert pulled[0]["cwd"] == str(repo / rel_path)
         assert pulled[1]["cwd"] == str(repo / rel_path)
+
+    def test_pull_remote_only_chat_to_target_dir(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        projects_dir = tmp_path / ".claude" / "projects"
+        monkeypatch.setattr(sync, "CLAUDE_PROJECTS_DIR", projects_dir)
+        monkeypatch.setattr(sync, "CODEX_HOME", tmp_path / ".codex")
+        monkeypatch.setattr(sync, "scan_local_git_repos", lambda: {})
+        drive = self._patch_fake_drive(monkeypatch, sync)
+
+        raw_url = "git@github.com:org/remote-only.git"
+        url_key = sync.normalize_git_url(raw_url)
+        repo_folder_id = drive.get_or_create_folder(None, url_key, drive.root_id)
+        drive.folders[repo_folder_id]["description"] = raw_url
+        subfolder_id = drive.get_or_create_folder(None, "src", repo_folder_id)
+        fname = "abcd1234-session.jsonl"
+        rows = [
+            {"type": "user", "uuid": "u1", "cwd": "/old/repo/src",
+             "message": {"role": "user", "content": "remote"}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+             "cwd": "/old/repo/src",
+             "message": {"role": "assistant", "content": "reply"}},
+        ]
+        drive.put_file(
+            subfolder_id, fname,
+            "".join(json.dumps(row) + "\n" for row in rows),
+            modified_time="2026-06-05T02:03:06Z",
+        )
+        target = tmp_path / "workspace"
+
+        out = run_sync([
+            "--pull", "--repo", "remote-only", "--chat", "abcd1234",
+            "--target-dir", str(target),
+        ], drive, drive.root_id)
+
+        check_format(out)
+        assert "1 pulled" in out
+        pulled_path = sync.claude_project_dir_for_path(target) / fname
+        pulled = [json.loads(line) for line in pulled_path.read_text().splitlines()]
+        assert {row["cwd"] for row in pulled} == {str(target)}
 
     def test_codex_run_sync_pulls_legacy_codex_subfolder(self, tmp_path, monkeypatch):
         import sync_claude_history as sync

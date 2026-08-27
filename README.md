@@ -96,6 +96,7 @@ python sync_claude_history.py --repo flashinfer         # 🎯 filter to specifi
 python sync_claude_history.py --repo flash,sglang       # 🎯 comma-separated repo filters
 python sync_claude_history.py --chat df9a6a22        # 💬 filter to specific conversation(s)
 python sync_claude_history.py --chat df9a,e520       # 💬 comma-separated chat ID prefixes
+python sync_claude_history.py --pull --repo org/repo --chat df9a --target-dir /work/new-repo # 📥 import without a local clone
 python sync_claude_history.py -d --repo sglang           # 🗑️  delete from Drive for a repo
 python sync_claude_history.py -d --repo sglang --dry-run # 🗑️  preview delete
 python sync_claude_history.py -d --repo sgl --chat df9a  # 🗑️  delete specific chat from Drive
@@ -118,6 +119,12 @@ pull, the script rewrites every entry's `cwd` to the *local* project dir's
 path — so if the repo lives at `/repo/path` on one machine and
 `/home/user/repo` on another, `--resume` works from the right place on both.
 The rewrite preserves mtime so it doesn't churn push/pull direction.
+
+To pull one chat for a repository that is not cloned locally, combine
+`--pull`, `--repo`, and `--chat`. The conversation is installed for the
+current directory and every `cwd` is rewritten to that directory. Pass
+`--target-dir DIR` to use a different directory; the directory does not need
+to be a Git checkout.
 
 ### Auto-trim at last compact
 

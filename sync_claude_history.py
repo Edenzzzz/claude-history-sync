@@ -2658,14 +2658,14 @@ def sync_memory(service, folder_id, local_dir: Path, args, indent="    ",
 
 def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=None,
                      rel_path=".", indent="    ", remote_files=None,
-                     require_remote_prefix=True):
+                     require_remote_prefix=True, local_cwd_override=None):
     """Sync Codex rollout JSONL files between local ~/.codex and Drive."""
     if remote_files is None:
         remote_files = list_remote_files(service, folder_id)
 
     chat_ids = getattr(args, "chat_id", None)
     chat_filters = [c.strip() for c in chat_ids.split(",")] if chat_ids else None
-    local_cwd = _codex_local_cwd(git_root, rel_path)
+    local_cwd = local_cwd_override or _codex_local_cwd(git_root, rel_path)
     remote_by_local = {}
     for remote_name, remote in remote_files.items():
         if require_remote_prefix:
@@ -3008,6 +3008,10 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
         remote_subfolders = list_drive_folders(service, repo_fid)
         repo_match = local_repos.get(match_key)
         git_root = repo_match[0] if repo_match else None
+        remote_only_target = (
+            args.remote_pull_target
+            if not git_root and match_key not in local_by_url else None
+        )
         raw_url = repo_match[1] if repo_match else raw_url
         if not git_root and match_key in local_by_url:
             git_root = next(
@@ -3015,6 +3019,8 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
                  for e in entries if e.get("git_root")),
                 None,
             )
+        if not git_root and remote_only_target:
+            git_root = remote_only_target
 
         subfolder_records = []
         current_codex_names_by_rel = {}
@@ -3113,6 +3119,7 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
                 indent="  ║   ",
                 remote_files=remote_sub_files,
                 require_remote_prefix=not legacy_codex_folder,
+                local_cwd_override=remote_only_target,
             )
             if pushed or pulled or remote_count:
                 any_activity = True
@@ -3273,6 +3280,15 @@ def generate_board(output_path: Path) -> Path:
 
 def run_sync(args, service, root_folder_id):
     """Run one sync cycle. Returns True if any changes were made."""
+    # A chat-specific pull may intentionally import history without cloning its
+    # repository. Keep this runtime-only so background jobs never inherit an
+    # invocation directory accidentally.
+    args.remote_pull_target = None
+    if (args.pull_only and args.repo and args.chat_id
+            and not args.delete and not getattr(args, "background", None)):
+        requested_target = getattr(args, "target_dir", None) or os.getcwd()
+        args.remote_pull_target = str(Path(requested_target).expanduser().resolve())
+
     # Build local index: git_url_key -> [(project_dir, raw_git_url), ...]
     local_index = build_local_index()
     codex_index = build_codex_index()
@@ -3677,6 +3693,7 @@ def run_sync(args, service, root_folder_id):
             if remote_subfolders is None:
                 continue
 
+            remote_only_target = None
             if match_key not in local_by_url:
                 # Try to find local git clone to auto-create Claude project dir
                 found_root = None
@@ -3687,6 +3704,19 @@ def run_sync(args, service, root_folder_id):
                     # so pull_git_root is set and subfolder sync auto-creates project dirs
                     local_by_url[match_key] = {".": (None, found_root)}
                 else:
+                    if args.remote_pull_target:
+                        remote_only_target = args.remote_pull_target
+                        local_by_url[match_key] = {
+                            drive_subfolder_to_rel_path(sf_name): (
+                                None, args.remote_pull_target
+                            )
+                            for sf_name in remote_subfolders
+                            if not is_codex_drive_subfolder(sf_name)
+                        }
+                        local_map = local_by_url[match_key]
+                    else:
+                        local_map = None
+                if match_key not in local_by_url:
                     total_convos = 0
                     total_size = 0
                     for sf_name in remote_subfolders:
@@ -3771,7 +3801,8 @@ def run_sync(args, service, root_folder_id):
                     pushed, pulled, skipped = sync_files(
                         service, subfolder_id, project_dir, args, indent="  ║   ",
                         remote_files=remote_sub_files, local_jsons=local_jsons,
-                        local_cwd=repo_local_cwd(pull_git_root, rel_path),
+                        local_cwd=(remote_only_target
+                                   or repo_local_cwd(pull_git_root, rel_path)),
                     )
                     if not getattr(args, "chat_id", None):
                         mem_pushed, mem_pulled = sync_memory(
@@ -3789,7 +3820,9 @@ def run_sync(args, service, root_folder_id):
                     if pull_git_root and rel_path != "." and is_gitignored(pull_git_root, rel_path):
                         continue
                     if pull_git_root and remote_count > 0:
-                        if rel_path == ".":
+                        if remote_only_target:
+                            full_path = remote_only_target
+                        elif rel_path == ".":
                             full_path = pull_git_root
                         else:
                             full_path = os.path.join(pull_git_root, rel_path)
@@ -4288,6 +4321,8 @@ def main():
                         help="Filter to repo(s) (comma-separated, substring match on git remote URL)")
     parser.add_argument("--chat", type=str, default=None, dest="chat_id",
                         help="Filter to conversation(s) (comma-separated, first 8+ chars of session ID)")
+    parser.add_argument("--target-dir", type=str, default=None, metavar="DIR",
+                        help="Import a remote-only chat into DIR (default: current directory; requires --pull --repo --chat)")
     parser.add_argument("--background", type=int, nargs="?", const=600, default=None,
                         metavar="SECONDS",
                         help="Run as background daemon, syncing every N seconds (default: 600)")
@@ -4308,6 +4343,10 @@ def main():
 
     if args.local and not args.delete:
         print("ERROR: --local requires --delete")
+        sys.exit(1)
+
+    if args.target_dir and not (args.pull_only and args.repo and args.chat_id):
+        print("ERROR: --target-dir requires --pull, --repo, and --chat")
         sys.exit(1)
 
     if args.delete and not args.repo and not args.chat_id:

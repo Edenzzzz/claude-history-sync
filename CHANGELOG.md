@@ -2,6 +2,7 @@
 
 ## v0.1.7
 
+- Allow chat-specific pulls for repositories that do not exist locally, rewriting `cwd` to `--target-dir` or the current directory by default.
 - Treat GitHub's `ssh.github.com` SSH alias as `github.com` when normalizing repo remotes, including legacy Drive folders, so both forms sync and pull under the same repo.
 - Show remote-only Codex rollouts in the project board so dry-run output names chats that would be pulled instead of only counting them.
 - Fix Codex trim equivalence: preserve the final compacted row's full `replacement_history` and exact post-compact rows so `codex resume` opens on the live tail instead of the fork/start prompt.
