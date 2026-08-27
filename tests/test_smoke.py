@@ -906,6 +906,44 @@ class TestCodexSupport:
         assert trimmed_again is False
         assert p.read_bytes() == once_trimmed
 
+    def test_trim_codex_discards_parent_session_meta(self, tmp_path):
+        """A fork's parent session header must not replace the rollout ID."""
+        from sync_claude_history import trim_codex_at_last_compact
+
+        p = tmp_path / "rollout-2026-06-22T06-20-18-019eedfc-child.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {
+                "id": "019eedfc-child", "forked_from_id": "019e3329-parent",
+                "cwd": "/repo",
+            }},
+            {"type": "session_meta", "payload": {
+                "id": "019e3329-parent", "cwd": "/repo",
+            }},
+            {"type": "compacted", "payload": {
+                "message": "", "replacement_history": [{
+                    "type": "compaction", "encrypted_content": "summary",
+                }],
+            }},
+            {"type": "event_msg", "payload": {
+                "type": "user_message",
+                "message": "<subagent_notification>done</subagent_notification>",
+            }},
+        ]
+        p.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+        trimmed, _, _ = trim_codex_at_last_compact(p)
+
+        assert trimmed is True
+        kept = [json.loads(line) for line in p.read_text().splitlines()]
+        assert [row["type"] for row in kept] == [
+            "session_meta", "compacted", "event_msg",
+        ]
+        assert kept[0]["payload"]["id"] == "019eedfc-child"
+
+        # Already-trimmed files containing duplicate headers are repaired too.
+        p.write_text("".join(json.dumps(row) + "\n" for row in rows[0:]))
+        assert trim_codex_at_last_compact(p)[0] is True
+
     def test_board_shows_claude_and_codex_prefixes(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
 

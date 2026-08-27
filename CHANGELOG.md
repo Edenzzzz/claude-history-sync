@@ -2,6 +2,7 @@
 
 ## v0.1.7
 
+- Fix forked Codex rollouts resuming with empty history by dropping the parent rollout's duplicate `session_meta` header during compacted-history reconstruction.
 - Allow chat-specific pulls for repositories that do not exist locally, rewriting `cwd` to `--target-dir` or the current directory by default.
 - Treat GitHub's `ssh.github.com` SSH alias as `github.com` when normalizing repo remotes, including legacy Drive folders, so both forms sync and pull under the same repo.
 - Show remote-only Codex rollouts in the project board so dry-run output names chats that would be pulled instead of only counting them.

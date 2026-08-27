@@ -1589,7 +1589,8 @@ def trim_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
 def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     """Trim a Codex rollout to its last valid compact point.
 
-    Keep the ``session_meta`` header, the final valid ``type=compacted`` row
+    Keep the rollout's primary ``session_meta`` header, the final valid
+    ``type=compacted`` row
     exactly as Codex wrote it, and every row after that compact point.  The
     compact row's full ``replacement_history`` is part of Codex's resume state;
     do not collapse it to just the encrypted compaction item.
@@ -1626,7 +1627,12 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     if compact_idx < 0:
         return False, before_size, before_size
 
-    header_lines = [i for i in header_lines if i < compact_idx]
+    # Forked Codex rollouts can contain the parent rollout's session_meta before
+    # compaction as well as their own primary header.  Keeping both makes Codex
+    # switch to the parent's ID during replay, while the picker opens the child
+    # ID from the filename/index, producing an apparently empty conversation.
+    # The first header is the rollout being reconstructed; discard later ones.
+    header_lines = [i for i in header_lines if i < compact_idx][:1]
     valid_before_compact = [
         i for i in range(compact_idx)
         if lines[i].strip() and parsed[i] is not None
