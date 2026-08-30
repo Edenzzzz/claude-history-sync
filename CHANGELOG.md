@@ -2,6 +2,7 @@
 
 ## v0.1.7
 
+- Keep applying `--target-dir` on repeated remote-only Codex pulls when an earlier downloaded rollout is indexed locally but no Git clone exists.
 - Stop automatically trimming Codex rollouts during sync because encrypted compaction state restores model context but not the visible pre-compaction transcript on another machine.
 - Register pulled Codex rollouts in `state_5.sqlite` so current Codex versions can find and resume them by session ID.
 - Fix forked Codex rollouts resuming with empty history by dropping the parent rollout's duplicate `session_meta` header during compacted-history reconstruction.

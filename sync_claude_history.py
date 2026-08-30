@@ -3070,10 +3070,6 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
         remote_subfolders = list_drive_folders(service, repo_fid)
         repo_match = local_repos.get(match_key)
         git_root = repo_match[0] if repo_match else None
-        remote_only_target = (
-            args.remote_pull_target
-            if not git_root and match_key not in local_by_url else None
-        )
         raw_url = repo_match[1] if repo_match else raw_url
         if not git_root and match_key in local_by_url:
             git_root = next(
@@ -3081,6 +3077,7 @@ def sync_codex_pull(service, root_folder_id, codex_git_projects: dict, args,
                  for e in entries if e.get("git_root")),
                 None,
             )
+        remote_only_target = args.remote_pull_target if not git_root else None
         if not git_root and remote_only_target:
             git_root = remote_only_target
 

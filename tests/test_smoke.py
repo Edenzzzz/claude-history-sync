@@ -1200,6 +1200,57 @@ class TestCodexSupport:
         assert ", remote)" in out
         assert "codex would push 1, would pull 1" in out
 
+    def test_codex_repeated_remote_only_pull_keeps_target(self, tmp_path, monkeypatch):
+        """An indexed prior pull without a Git clone must still use target-dir."""
+        import argparse
+        import sync_claude_history as sync
+
+        drive = self._patch_fake_drive(monkeypatch, sync)
+        raw_url = "git@github.com:org/remote-only.git"
+        url_key = sync.normalize_git_url(raw_url)
+        repo_id = drive.get_or_create_folder(None, url_key, drive.root_id)
+        drive.folders[repo_id]["description"] = raw_url
+        folder_id = drive.get_or_create_folder(None, "_root", repo_id)
+        fname = "rollout-2026-06-05T02-03-04-019eedfc-repeat.jsonl"
+        drive.put_file(folder_id, f"_codex__{fname}", json.dumps({
+            "type": "session_meta", "payload": {
+                "id": "019eedfc-repeat", "cwd": "/old",
+                "git": {"repository_url": raw_url},
+            },
+        }) + "\n")
+        local_path = tmp_path / fname
+        local_path.write_text(json.dumps({
+            "type": "session_meta", "payload": {
+                "id": "019eedfc-repeat", "cwd": "/previous-target",
+                "git": {"repository_url": raw_url},
+            },
+        }) + "\n")
+        existing = {
+            "path": local_path, "session_id": "019eedfc-repeat",
+            "git_url": raw_url, "git_root": None, "rel_path": ".",
+            "title": None,
+        }
+        monkeypatch.setattr(sync, "scan_local_git_repos", lambda: {})
+        calls = []
+        monkeypatch.setattr(
+            sync, "sync_codex_files",
+            lambda *a, **kw: calls.append(kw) or (0, 0, 1),
+        )
+        target = str(tmp_path / "new-target")
+        args = argparse.Namespace(
+            push_only=False, pull_only=True, repo="remote-only",
+            chat_id="019eedfc", dry_run=False, verbose=False,
+            remote_pull_target=target,
+        )
+
+        sync.sync_codex_pull(
+            drive, drive.root_id, {url_key: [existing]}, args,
+        )
+
+        assert calls
+        assert calls[0]["git_root"] == target
+        assert calls[0]["local_cwd_override"] == target
+
     def test_codex_pull_matches_existing_github_ssh_alias_remote_folder(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
 
