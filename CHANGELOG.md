@@ -2,6 +2,8 @@
 
 ## v0.1.7
 
+- Stop automatically trimming Codex rollouts during sync because encrypted compaction state restores model context but not the visible pre-compaction transcript on another machine.
+- Register pulled Codex rollouts in `state_5.sqlite` so current Codex versions can find and resume them by session ID.
 - Fix forked Codex rollouts resuming with empty history by dropping the parent rollout's duplicate `session_meta` header during compacted-history reconstruction.
 - Allow chat-specific pulls for repositories that do not exist locally, rewriting `cwd` to `--target-dir` or the current directory by default.
 - Treat GitHub's `ssh.github.com` SSH alias as `github.com` when normalizing repo remotes, including legacy Drive folders, so both forms sync and pull under the same repo.

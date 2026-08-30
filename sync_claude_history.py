@@ -742,6 +742,10 @@ def parse_codex_rollout(jsonl_path: Path) -> dict:
         "created_at": None,
         "updated_at": None,
         "first_user_message": None,
+        "source": None,
+        "model_provider": None,
+        "cli_version": None,
+        "thread_source": None,
     }
     fallback_first_user_message = None
     for entry in _iter_jsonl_objects(jsonl_path):
@@ -757,6 +761,8 @@ def parse_codex_rollout(jsonl_path: Path) -> dict:
             meta["session_id"] = meta["session_id"] or payload.get("id")
             meta["cwd"] = meta["cwd"] or payload.get("cwd")
             meta["created_at"] = meta["created_at"] or _parse_time_value(payload.get("timestamp"))
+            for key in ("source", "model_provider", "cli_version", "thread_source"):
+                meta[key] = meta[key] or payload.get(key)
             git_info = payload.get("git")
             if isinstance(git_info, dict):
                 meta["git_url"] = meta["git_url"] or git_info.get("repository_url")
@@ -1074,7 +1080,7 @@ def build_codex_index(codex_home: Path | None = None) -> dict:
 
 
 def upsert_codex_session_index(entries: list[dict], codex_home: Path | None = None):
-    """Make pulled Codex rollouts discoverable by session_index.jsonl."""
+    """Make pulled Codex rollouts discoverable by current and legacy Codex."""
     if not entries:
         return
     codex_home = Path(codex_home or CODEX_HOME).expanduser()
@@ -1126,6 +1132,74 @@ def upsert_codex_session_index(entries: list[dict], codex_home: Path | None = No
     tmp = index_path.with_suffix(index_path.suffix + ".tmp")
     tmp.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in merged))
     tmp.replace(index_path)
+    _upsert_codex_sqlite_threads(entries, codex_home)
+
+
+def _upsert_codex_sqlite_threads(entries: list[dict], codex_home: Path) -> None:
+    """Register pulled rollouts in the database used by current Codex builds."""
+    db_path = codex_home / "state_5.sqlite"
+    if not db_path.exists():
+        return
+
+    con = None
+    try:
+        con = sqlite3.connect(db_path, timeout=10)
+        available = {
+            row[1] for row in con.execute("pragma table_info(threads)")
+        }
+        required = {
+            "id", "rollout_path", "created_at", "updated_at", "source",
+            "model_provider", "cwd", "title", "sandbox_policy",
+            "approval_mode",
+        }
+        if not required.issubset(available):
+            return
+
+        for entry in entries:
+            sid = entry.get("session_id")
+            path = entry.get("path")
+            if not sid or not path:
+                continue
+            created = int(entry.get("created_at") or entry.get("updated_at") or time.time())
+            updated = int(entry.get("updated_at") or created)
+            title = entry.get("title") or entry.get("first_user_message") or sid
+            values = {
+                "id": sid,
+                "rollout_path": str(Path(path).expanduser().resolve()),
+                "created_at": created,
+                "updated_at": updated,
+                "source": entry.get("source") or "cli",
+                "model_provider": entry.get("model_provider") or "openai",
+                "cwd": entry.get("cwd") or "",
+                "title": title,
+                "sandbox_policy": "{}",
+                "approval_mode": "never",
+                "has_user_event": 1,
+                "git_origin_url": entry.get("git_url"),
+                "cli_version": entry.get("cli_version") or "",
+                "first_user_message": entry.get("first_user_message") or title,
+                "thread_source": entry.get("thread_source") or "user",
+                "preview": entry.get("first_user_message") or title,
+                "created_at_ms": created * 1000,
+                "updated_at_ms": updated * 1000,
+                "recency_at": updated,
+                "recency_at_ms": updated * 1000,
+            }
+            columns = [key for key in values if key in available]
+            update_columns = [key for key in columns if key != "id"]
+            placeholders = ", ".join("?" for _ in columns)
+            updates = ", ".join(f"{key}=excluded.{key}" for key in update_columns)
+            con.execute(
+                f"insert into threads ({', '.join(columns)}) values ({placeholders}) "
+                f"on conflict(id) do update set {updates}",
+                [values[key] for key in columns],
+            )
+        con.commit()
+    except sqlite3.Error as exc:
+        print(f"WARNING: Could not update Codex session database: {exc}")
+    finally:
+        if con is not None:
+            con.close()
 
 
 REPO_CACHE_PATH = SCRIPT_DIR / ".repo_cache.json"
@@ -2700,20 +2774,6 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             if n:
                 print(f"{indent}[codex CWD REWRITE] {fname} ({n} entries -> {local_cwd})")
 
-    just_trimmed = set()
-    if not args.dry_run:
-        for fname, entry in list(by_name.items()):
-            try:
-                trimmed, before, after = trim_codex_at_last_compact(entry["path"])
-            except (OSError, ValueError):
-                continue
-            if trimmed:
-                just_trimmed.add(fname)
-                saved_pct = 100 * (before - after) / before if before else 0
-                print(f"{indent}[TRIMMED] {fname} "
-                      f"{format_size(before)} → {format_size(after)} "
-                      f"(-{saved_pct:.1f}%)")
-
     pushed = pulled = skipped = 0
     pulled_entries = []
 
@@ -2747,14 +2807,11 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
                 remote["modifiedTime"].replace("Z", "+00:00")
             ).timestamp()
             remote_size = int(remote.get("size", 0))
-            has_pretrim_bak = local_path.with_suffix(
-                local_path.suffix + ".pretrim.bak").exists()
-            local_is_valid_trim = fname in just_trimmed or has_pretrim_bak
             local_is_newer = local_mtime > remote_mtime
             remote_is_newer = remote_mtime > local_mtime
             should_push = (
                 not args.pull_only
-                and (local_is_newer or local_is_valid_trim)
+                and local_is_newer
             )
             if should_push:
                 if not args.dry_run:
@@ -2767,7 +2824,6 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             elif remote_is_newer and not args.push_only:
                 if not args.dry_run:
                     download_file(service, remote["id"], local_path)
-                    trim_codex_at_last_compact(local_path)
                     if local_cwd:
                         rewrite_codex_cwd_if_needed(local_path, local_cwd)
                     pulled_meta = parse_codex_rollout(local_path)
@@ -2815,13 +2871,10 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
 
                 local_mtime = local_path.stat().st_mtime
                 local_size = local_path.stat().st_size
-                has_pretrim_bak = local_path.with_suffix(
-                    local_path.suffix + ".pretrim.bak").exists()
-                local_is_valid_trim = has_pretrim_bak
                 local_is_newer = local_mtime > remote_mtime
                 remote_is_newer = remote_mtime > local_mtime
                 if (not args.pull_only
-                        and (local_is_newer or local_is_valid_trim)):
+                        and local_is_newer):
                     if not args.dry_run:
                         media = MediaFileUpload(str(local_path))
                         service.files().update(
@@ -2838,7 +2891,6 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             if not args.dry_run:
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 download_file(service, remote["id"], local_path)
-                trim_codex_at_last_compact(local_path)
                 if local_cwd:
                     rewrite_codex_cwd_if_needed(local_path, local_cwd)
                 pulled_meta = parse_codex_rollout(local_path)
@@ -2851,7 +2903,11 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             pulled += 1
 
     if not args.dry_run:
-        upsert_codex_session_index(pulled_entries)
+        # Registration is required even when the rollout bytes are unchanged:
+        # a copied/downloaded file may exist without a state_5.sqlite row, and
+        # current Codex then reports "No saved session found" by ID.
+        index_entries = list(by_name.values()) + pulled_entries
+        upsert_codex_session_index(index_entries)
 
     if titles_changed and not args.dry_run:
         upload_string(

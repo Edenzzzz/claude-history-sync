@@ -846,6 +846,81 @@ class TestCodexSupport:
             "updated_at": "2026-06-03T15:20:00Z",
         }]
 
+    def test_pulled_codex_session_is_registered_in_sqlite(self, tmp_path):
+        import sqlite3
+        from pathlib import Path
+        from sync_claude_history import upsert_codex_session_index
+
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        db = sqlite3.connect(codex_home / "state_5.sqlite")
+        db.execute("""create table threads (
+            id text primary key, rollout_path text not null,
+            created_at integer not null, updated_at integer not null,
+            source text not null, model_provider text not null, cwd text not null,
+            title text not null, sandbox_policy text not null,
+            approval_mode text not null, has_user_event integer not null default 0,
+            git_origin_url text, cli_version text not null default '',
+            first_user_message text not null default '', thread_source text,
+            preview text not null default '', created_at_ms integer,
+            updated_at_ms integer, recency_at integer not null default 0,
+            recency_at_ms integer not null default 0
+        )""")
+        db.commit()
+        db.close()
+        rollout = codex_home / "sessions" / "rollout-019eedfc.jsonl"
+
+        upsert_codex_session_index([{
+            "session_id": "019eedfc-child", "path": rollout,
+            "cwd": "/target", "title": "restored chat",
+            "first_user_message": "original prompt", "created_at": 100,
+            "updated_at": 200, "git_url": "git@example:repo.git",
+        }], codex_home)
+
+        db = sqlite3.connect(codex_home / "state_5.sqlite")
+        row = db.execute(
+            "select rollout_path, cwd, title, first_user_message, has_user_event "
+            "from threads where id='019eedfc-child'"
+        ).fetchone()
+        db.close()
+        assert row == (
+            str(Path(rollout).resolve()), "/target", "restored chat",
+            "original prompt", 1,
+        )
+
+    def test_unchanged_codex_session_is_registered(self, tmp_path, monkeypatch):
+        import sync_claude_history as sync
+
+        rollout = tmp_path / "rollout-019eedfc-child.jsonl"
+        rollout.write_text(json.dumps({
+            "type": "session_meta", "payload": {
+                "id": "019eedfc-child", "cwd": "/target",
+            },
+        }) + "\n")
+        entry = {
+            "path": rollout, "session_id": "019eedfc-child",
+            "cwd": "/target", "title": None,
+        }
+        captured = []
+        monkeypatch.setattr(
+            sync, "upsert_codex_session_index",
+            lambda entries, codex_home=None: captured.extend(entries),
+        )
+        remote = {
+            "_codex__" + rollout.name: {
+                "md5Checksum": sync.local_file_md5(rollout),
+                "modifiedTime": "2026-06-22T06:20:18Z",
+                "size": str(rollout.stat().st_size),
+            },
+        }
+        args = _parse_args(["--pull", "--chat", "019eedfc"])
+
+        assert sync.sync_codex_files(
+            None, "folder", [entry], args, git_root="/target",
+            remote_files=remote,
+        ) == (0, 0, 1)
+        assert [item["session_id"] for item in captured] == ["019eedfc-child"]
+
     def test_trim_codex_at_last_compact_preserves_tail(self, tmp_path):
         from sync_claude_history import parse_codex_rollout, trim_codex_at_last_compact
 
@@ -1307,7 +1382,7 @@ class TestCodexSupport:
         assert "newer local tail" in local_path.read_text()
         assert b"newer local tail" in drive.folders[folder_id]["files"][remote_name]["content"]
 
-    def test_codex_sync_pushes_valid_trim_even_when_remote_is_bigger(self, tmp_path, monkeypatch):
+    def test_codex_sync_does_not_force_push_pretrim_backup(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
 
         repo = self._git_repo(tmp_path)
@@ -1359,10 +1434,10 @@ class TestCodexSupport:
 
         out = run_sync([], drive, drive.root_id)
         check_format(out)
-        assert "codex 1 pushed, 0 pulled, 0 unchanged" in out
+        assert "codex 0 pushed, 1 pulled, 0 unchanged" in out
         remote_content = drive.folders[codex_folder_id]["files"][remote_name]["content"].decode()
-        assert "trimmed tail" in remote_content
-        assert "remote stale" not in rollout.read_text()
+        assert "remote stale" in remote_content
+        assert "remote stale" in rollout.read_text()
 
     def test_claude_pull_rewrites_cwd_from_drive_rel_path(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
