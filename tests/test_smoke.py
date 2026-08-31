@@ -1019,6 +1019,56 @@ class TestCodexSupport:
         p.write_text("".join(json.dumps(row) + "\n" for row in rows[0:]))
         assert trim_codex_at_last_compact(p)[0] is True
 
+    def test_codex_pretrim_tail_integrity_check(self, tmp_path):
+        from sync_claude_history import verify_codex_pretrim_tail
+
+        p = tmp_path / "rollout.jsonl"
+        backup = p.with_suffix(".jsonl.pretrim.bak")
+        compact = {"type": "compacted", "payload": {
+            "replacement_history": [{"type": "compaction", "encrypted_content": "summary"}],
+        }}
+        tail = {"type": "turn_context", "payload": {"cwd": "/original"}}
+        backup.write_text("".join(json.dumps(row) + "\n" for row in [
+            {"type": "session_meta", "payload": {"id": "sid"}},
+            {"type": "response_item", "payload": {"type": "message"}},
+            compact, tail,
+        ]))
+        p.write_text("".join(json.dumps(row) + "\n" for row in [
+            {"type": "session_meta", "payload": {"id": "sid"}},
+            compact,
+            {"type": "turn_context", "payload": {"cwd": "/rewritten"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "later"}},
+        ]))
+
+        assert verify_codex_pretrim_tail(p) == (True, None)
+
+        rows = [json.loads(line) for line in p.read_text().splitlines()]
+        rows[1]["payload"]["replacement_history"][0]["encrypted_content"] = "wrong"
+        p.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        valid, reason = verify_codex_pretrim_tail(p)
+        assert valid is False
+        assert "retained row 1" in reason
+
+    def test_codex_push_aborts_on_pretrim_tail_mismatch(self, tmp_path, capsys):
+        import argparse
+        import sync_claude_history as sync
+
+        p = tmp_path / "rollout-bad.jsonl"
+        p.write_text(json.dumps({"type": "compacted", "payload": {"message": "changed"}}) + "\n")
+        p.with_suffix(".jsonl.pretrim.bak").write_text(
+            json.dumps({"type": "compacted", "payload": {"message": "original"}}) + "\n"
+        )
+        args = argparse.Namespace(
+            pull_only=False, push_only=True, chat_id=None, dry_run=False,
+        )
+
+        assert sync.sync_codex_files(
+            None, "folder", [{"path": p, "session_id": "bad", "title": None}],
+            args, remote_files={},
+        ) == (0, 0, 0)
+        assert args.integrity_failed is True
+        assert "ERROR: Codex history integrity check failed" in capsys.readouterr().out
+
     def test_board_shows_claude_and_codex_prefixes(self, tmp_path, monkeypatch):
         import sync_claude_history as sync
 

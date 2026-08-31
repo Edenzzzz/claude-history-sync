@@ -192,6 +192,10 @@ SERVICE_ACCOUNT_PATH = SCRIPT_DIR / "service-account.json"
 CODEX_DRIVE_PREFIX = "_codex__"
 
 
+class SyncIntegrityError(RuntimeError):
+    """Raised when uploading would preserve a corrupted conversation."""
+
+
 # ---------------------------------------------------------------------------
 # Google Drive helpers
 # ---------------------------------------------------------------------------
@@ -1742,6 +1746,56 @@ def trim_codex_at_last_compact(jsonl_path: Path) -> tuple[bool, int, int]:
     return True, before_size, after_size
 
 
+def verify_codex_pretrim_tail(jsonl_path: Path) -> tuple[bool, str | None]:
+    """Verify that a trimmed rollout retained the backup's exact live tail.
+
+    A resumed rollout may append rows after trimming, so the backup tail must
+    be a prefix of the current tail. CWD fields are ignored because pull
+    intentionally rewrites them for the destination machine.
+    """
+    backup = jsonl_path.with_suffix(jsonl_path.suffix + ".pretrim.bak")
+    if not backup.exists():
+        return True, None
+
+    def compact_tail(path: Path):
+        rows = list(_iter_jsonl_objects(path))
+        compact_idx = next(
+            (i for i in range(len(rows) - 1, -1, -1)
+             if rows[i].get("type") == "compacted"),
+            None,
+        )
+        if compact_idx is None:
+            return None
+
+        def normalize(value):
+            if isinstance(value, dict):
+                return {
+                    key: ("<cwd>" if key == "cwd" else normalize(item))
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [normalize(item) for item in value]
+            return value
+
+        return [normalize(row) for row in rows[compact_idx:]]
+
+    original_tail = compact_tail(backup)
+    current_tail = compact_tail(jsonl_path)
+    if original_tail is None:
+        return True, None
+    if current_tail is None:
+        return False, "current rollout has lost the backup's compacted tail"
+    if len(current_tail) < len(original_tail):
+        return False, (
+            f"current tail has {len(current_tail)} rows; backup has "
+            f"{len(original_tail)}"
+        )
+    for index, original in enumerate(original_tail):
+        if current_tail[index] != original:
+            return False, f"tail differs from backup at retained row {index + 1}"
+    return True, None
+
+
 def repair_uuid_chain(jsonl_path: Path) -> int:
     """Fix broken parentUuid links and remove orphan/duplicate entries.
 
@@ -2768,6 +2822,20 @@ def sync_codex_files(service, folder_id, entries: list[dict], args, git_root=Non
             continue
         by_name[fname] = entry
 
+    if not args.pull_only:
+        invalid_names = []
+        for fname, entry in by_name.items():
+            valid, reason = verify_codex_pretrim_tail(entry["path"])
+            if not valid:
+                print(
+                    f"{indent}ERROR: Codex history integrity check failed for "
+                    f"{fname}: {reason}. Upload skipped; .pretrim.bak was not modified."
+                )
+                invalid_names.append(fname)
+                args.integrity_failed = True
+        for fname in invalid_names:
+            del by_name[fname]
+
     if not args.dry_run and local_cwd:
         for fname, entry in list(by_name.items()):
             n = rewrite_codex_cwd_if_needed(entry["path"], local_cwd)
@@ -3339,6 +3407,8 @@ def generate_board(output_path: Path) -> Path:
 
 def run_sync(args, service, root_folder_id):
     """Run one sync cycle. Returns True if any changes were made."""
+    args.integrity_failed = False
+
     # A chat-specific pull may intentionally import history without cloning its
     # repository. Keep this runtime-only so background jobs never inherit an
     # invocation directory accidentally.
@@ -4668,6 +4738,8 @@ def main():
                     print(f"PID: {pid} (keepalive: {keepalive_method})")
 
         run_sync(args, service, root_folder_id)
+        if args.integrity_failed:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
